@@ -1,7 +1,7 @@
 {
-  "name": "hazelcast-client",
-  "version": "3.12.4",
-  "description": "Hazelcast - open source In-Memory Data Grid - client for NodeJS",
+  "name": "@celerispay/hazelcast-client",
+  "version": "3.12.5",
+  "description": "Hazelcast - open source In-Memory Data Grid - client for NodeJS with critical connection failover fixes",
   "main": "lib/index.js",
   "dependencies": {
     "bluebird": "3.7.2",
@@ -42,7 +42,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/hazelcast/hazelcast-nodejs-client.git"
+    "url": "git+https://github.com/celerispay/hazelcast-nodejs-client.git"
   },
   "keywords": [
     "hazelcast",
@@ -50,12 +50,14 @@
     "node",
     "client",
     "data",
-    "grid"
+    "grid",
+    "failover",
+    "connection-fix"
   ],
   "license": "Apache-2.0",
   "bugs": {
-    "url": "https://github.com/hazelcast/hazelcast-nodejs-client/issues"
+    "url": "https://github.com/celerispay/hazelcast-nodejs-client/issues"
   },
-  "homepage": "https://github.com/hazelcast/hazelcast-nodejs-client#readme",
+  "homepage": "https://github.com/celerispay/hazelcast-nodejs-client#readme",
   "typings": "./lib/index"
 }

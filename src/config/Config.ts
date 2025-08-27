@@ -55,6 +55,14 @@ export class ClientConfig {
         'hazelcast.client.autopipelining.enabled': true,
         'hazelcast.client.autopipelining.threshold.bytes': 8192,
         'hazelcast.client.socket.no.delay': true,
+        // Enhanced connection management properties
+        'hazelcast.client.connection.health.check.interval': 5000,
+        'hazelcast.client.connection.max.retries': 3,
+        'hazelcast.client.connection.retry.delay': 1000,
+        'hazelcast.client.failover.cooldown': 5000,
+        'hazelcast.client.partition.refresh.min.interval': 2000,
+        'hazelcast.client.invocation.max.retries': 10,
+        'hazelcast.client.partition.failure.backoff': 2000,
     };
 
     /**

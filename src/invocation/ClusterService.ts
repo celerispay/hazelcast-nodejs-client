@@ -59,6 +59,11 @@ export class ClusterService {
     private ownerConnection: ClientConnection;
     private membershipListeners: Map<string, MembershipListener> = new Map();
     private logger: ILogger;
+    private failoverInProgress: boolean = false;
+    private lastFailoverAttempt: number = 0;
+    private readonly failoverCooldown: number = 5000; // 5 seconds cooldown between failover attempts
+    private downAddresses: Map<string, number> = new Map(); // address -> timestamp when marked down
+    private readonly addressBlockDuration: number = 30000; // 30 seconds block duration for down addresses
 
     constructor(client: HazelcastClient) {
         this.client = client;
@@ -222,7 +227,7 @@ export class ClusterService {
         this.logger.warn('ClusterService', 'Connection closed to ' + connection.toString());
         if (connection.isAuthenticatedAsOwner()) {
             this.ownerConnection = null;
-            this.connectToCluster().catch(this.client.shutdown.bind(this.client));
+            this.triggerFailover();
         }
     }
 
@@ -230,13 +235,99 @@ export class ClusterService {
         this.logger.warn('ClusterService', connection.toString() + ' stopped heartbeating.');
         if (connection.isAuthenticatedAsOwner()) {
             this.client.getConnectionManager().destroyConnection(connection.getAddress());
+            this.ownerConnection = null;
+            this.triggerFailover();
         }
+    }
+
+    private triggerFailover(): void {
+        const now = Date.now();
+        if (this.failoverInProgress || (now - this.lastFailoverAttempt) < this.failoverCooldown) {
+            this.logger.debug('ClusterService', 'Failover already in progress or too soon since last attempt');
+            return;
+        }
+
+        this.failoverInProgress = true;
+        this.lastFailoverAttempt = now;
+
+        this.logger.info('ClusterService', 'Starting failover process...');
+        
+        // Clear any stale partition information
+        this.client.getPartitionService().clearPartitionTable();
+        
+        // Attempt to reconnect to cluster
+        this.connectToCluster()
+            .then(() => {
+                this.logger.info('ClusterService', 'Failover completed successfully');
+            })
+            .catch((error) => {
+                this.logger.error('ClusterService', 'Failover failed', error);
+                // If failover fails, shutdown the client to prevent further issues
+                this.client.shutdown();
+            })
+            .finally(() => {
+                this.failoverInProgress = false;
+            });
+    }
+
+    private isAddressKnownDown(address: Address): boolean {
+        const addressStr = address.toString();
+        const downTime = this.downAddresses.get(addressStr);
+        
+        if (!downTime) {
+            return false;
+        }
+        
+        const now = Date.now();
+        const timeSinceDown = now - downTime;
+        
+        // If address has been down for longer than block duration, unblock it
+        if (timeSinceDown > this.addressBlockDuration) {
+            this.logger.debug('ClusterService', `Unblocking address ${addressStr} after ${this.addressBlockDuration}ms`);
+            this.downAddresses.delete(addressStr);
+            return false;
+        }
+        
+        // Address is still blocked
+        const remainingBlockTime = this.addressBlockDuration - timeSinceDown;
+        this.logger.debug('ClusterService', `Address ${addressStr} is blocked for ${remainingBlockTime}ms more`);
+        return true;
+    }
+
+    private markAddressAsDown(address: Address): void {
+        const addressStr = address.toString();
+        const now = Date.now();
+        
+        this.downAddresses.set(addressStr, now);
+        this.logger.warn('ClusterService', `Marked address ${addressStr} as down, will be blocked for ${this.addressBlockDuration}ms`);
+        
+        // Schedule cleanup of this address after block duration
+        setTimeout(() => {
+            if (this.downAddresses.has(addressStr)) {
+                this.logger.info('ClusterService', `Unblocking address ${addressStr} after block duration`);
+                this.downAddresses.delete(addressStr);
+            }
+        }, this.addressBlockDuration);
+    }
+
+    private getDownAddressesInfo(): string {
+        const now = Date.now();
+        const downInfo: string[] = [];
+        
+        this.downAddresses.forEach((downTime, address) => {
+            const timeSinceDown = now - downTime;
+            const remainingTime = Math.max(0, this.addressBlockDuration - timeSinceDown);
+            downInfo.push(`${address} (${Math.ceil(remainingTime / 1000)}s remaining)`);
+        });
+        
+        return downInfo.length > 0 ? downInfo.join(', ') : 'none';
     }
 
     private tryConnectingToAddresses(index: number, remainingAttemptLimit: number,
                                      attemptPeriod: number, cause?: Error): Promise<void> {
         this.logger.debug('ClusterService', 'Trying to connect to addresses, remaining attempt limit: ' + remainingAttemptLimit
-            + ', attempt period: ' + attemptPeriod);
+            + ', attempt period: ' + attemptPeriod + ', down addresses: ' + this.getDownAddressesInfo());
+        
         if (this.knownAddresses.length <= index) {
             remainingAttemptLimit = remainingAttemptLimit - 1;
             if (remainingAttemptLimit === 0) {
@@ -263,12 +354,21 @@ export class ClusterService {
             }
         } else {
             const currentAddress = this.knownAddresses[index];
+            
+            // Skip addresses that are known to be down
+            if (this.isAddressKnownDown(currentAddress)) {
+                this.logger.debug('ClusterService', `Skipping known down address: ${currentAddress.toString()}`);
+                return this.tryConnectingToAddresses(index + 1, remainingAttemptLimit, attemptPeriod, cause);
+            }
+
             return this.client.getConnectionManager().getOrConnect(currentAddress, true).then((connection: ClientConnection) => {
                 connection.setAuthenticatedAsOwner(true);
                 this.ownerConnection = connection;
+                this.logger.info('ClusterService', `Successfully connected to owner node: ${currentAddress.toString()}`);
                 return this.initMembershipListener();
             }).catch((e) => {
-                this.logger.warn('ClusterService', e);
+                this.logger.warn('ClusterService', `Failed to connect to ${currentAddress.toString()}:`, e);
+                this.markAddressAsDown(currentAddress);
                 return this.tryConnectingToAddresses(index + 1, remainingAttemptLimit, attemptPeriod, e);
             });
         }

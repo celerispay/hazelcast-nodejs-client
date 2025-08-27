@@ -36,7 +36,7 @@ export class ClientNetworkConfig {
      * all might be not available. Instead of giving up, throwing Exception and stopping client, it will
      * attempt to retry as much as {@link connectionAttemptLimit} times.
      */
-    connectionAttemptLimit: number = 2;
+    connectionAttemptLimit: number = 5; // Increased from 2 to 5 for better reliability
     /**
      * Period for the next attempt to find a member to connect.
      */
@@ -44,11 +44,11 @@ export class ClientNetworkConfig {
     /**
      * Timeout value in millis for nodes to accept client connection requests.
      */
-    connectionTimeout: number = 5000;
+    connectionTimeout: number = 10000; // Increased from 5000 to 10000 for better reliability
     /**
      * true if redo operations are enabled.
      */
-    redoOperation: boolean = false;
+    redoOperation: boolean = true; // Changed to true for better failover support
     /**
      * If true, client will behave as smart client instead of dummy client. Smart client sends key based operations
      * to owner of the keys. Dummy client sends all operations to a single node. See http://docs.hazelcast.org to

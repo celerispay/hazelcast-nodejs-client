@@ -44,6 +44,10 @@ export class ClientConnectionManager extends EventEmitter {
     private pendingConnections: { [address: string]: Promise.Resolver<ClientConnection> } = {};
     private logger: ILogger;
     private readonly addressTranslator: AddressTranslator;
+    private connectionHealthCheckInterval: any; // Use any instead of NodeJS.Timeout for compatibility
+    private failedConnections: Set<string> = new Set();
+    private readonly maxConnectionRetries: number = 3;
+    private readonly connectionRetryDelay: number = 1000;
 
     constructor(client: HazelcastClient, addressTranslator: AddressTranslator, addressProviders: AddressProvider[]) {
         super();
@@ -51,6 +55,76 @@ export class ClientConnectionManager extends EventEmitter {
         this.logger = this.client.getLoggingService().getLogger();
         this.addressTranslator = addressTranslator;
         this.addressProviders = addressProviders;
+        this.startConnectionHealthCheck();
+    }
+
+    private startConnectionHealthCheck(): void {
+        // Check connection health every 5 seconds
+        this.connectionHealthCheckInterval = setInterval(() => {
+            this.checkConnectionHealth();
+        }, 5000);
+    }
+
+    private checkConnectionHealth(): void {
+        // Use Object.keys() instead of Object.values() for compatibility
+        const connectionKeys = Object.keys(this.establishedConnections);
+        for (const key of connectionKeys) {
+            const connection = this.establishedConnections[key];
+            if (!connection.isAlive()) {
+                this.logger.warn('ClientConnectionManager', 
+                    `Connection to ${connection.getAddress().toString()} is not alive, destroying it`);
+                this.destroyConnection(connection.getAddress());
+            }
+        }
+    }
+
+    private isConnectionHealthy(connection: ClientConnection): boolean {
+        // Only check if connection is alive - isAuthenticated() method doesn't exist
+        return connection.isAlive();
+    }
+
+    private retryConnection(address: Address, asOwner: boolean, retryCount: number = 0): Promise<ClientConnection> {
+        return this.createConnection(address, asOwner).then((connection) => {
+            this.failedConnections.delete(address.toString());
+            return connection;
+        }).catch((error) => {
+            if (retryCount < this.maxConnectionRetries) {
+                this.logger.warn('ClientConnectionManager', 
+                    `Connection attempt ${retryCount + 1} failed for ${address.toString()}, retrying in ${this.connectionRetryDelay}ms`);
+                return new Promise((resolve) => {
+                    setTimeout(() => {
+                        this.retryConnection(address, asOwner, retryCount + 1).then(resolve).catch(resolve);
+                    }, this.connectionRetryDelay);
+                });
+            } else {
+                this.failedConnections.add(address.toString());
+                this.logger.error('ClientConnectionManager', 
+                    `Failed to connect to ${address.toString()} after ${this.maxConnectionRetries} attempts`);
+                throw error;
+            }
+        });
+    }
+
+    private createConnection(address: Address, asOwner: boolean): Promise<ClientConnection> {
+        return this.addressTranslator.translate(address).then((addr) => {
+            if (addr == null) {
+                throw new RangeError('Address Translator could not translate address ' + address.toString());
+            }
+
+            return this.triggerConnect(addr, asOwner).then((socket: net.Socket) => {
+                const clientConnection = new ClientConnection(this.client, addr, socket);
+
+                return this.initiateCommunication(clientConnection).then(() => {
+                    return clientConnection.registerResponseCallback((data: Buffer) => {
+                        this.client.getInvocationService().processResponse(data);
+                    });
+                }).then(() => {
+                    return this.authenticate(clientConnection, asOwner);
+                }).then(() => {
+                    return clientConnection;
+                });
+            });
+        });
     }
 
     getActiveConnections(): { [address: string]: ClientConnection } {
@@ -67,46 +141,48 @@ export class ClientConnectionManager extends EventEmitter {
     getOrConnect(address: Address, asOwner: boolean = false): Promise<ClientConnection> {
         const addressIndex = address.toString();
 
+        // Check if connection is already established and healthy
         const establishedConnection = this.establishedConnections[addressIndex];
-        if (establishedConnection) {
+        if (establishedConnection && this.isConnectionHealthy(establishedConnection)) {
             return Promise.resolve(establishedConnection);
         }
 
+        // If existing connection is unhealthy, destroy it
+        if (establishedConnection && !this.isConnectionHealthy(establishedConnection)) {
+            this.logger.warn('ClientConnectionManager', 
+                `Destroying unhealthy connection to ${addressIndex}`);
+            this.destroyConnection(address);
+        }
+
+        // Check if we're already trying to connect
         const pendingConnection = this.pendingConnections[addressIndex];
         if (pendingConnection) {
             return pendingConnection.promise;
         }
 
+        // Check if this address has failed too many times recently
+        if (this.failedConnections.has(addressIndex)) {
+            const error = new Error(`Address ${addressIndex} has failed recently and is temporarily blocked`);
+            return Promise.reject(error);
+        }
+
         const connectionResolver: Promise.Resolver<ClientConnection> = DeferredPromise<ClientConnection>();
         this.pendingConnections[addressIndex] = connectionResolver;
 
-        const processResponseCallback = (data: Buffer) => {
-            this.client.getInvocationService().processResponse(data);
-        };
-
-        this.addressTranslator.translate(address).then((addr) => {
-            if (addr == null) {
-                throw new RangeError('Address Translator could not translate address ' + addr.toString());
-            }
-
-            this.triggerConnect(addr, asOwner).then((socket: net.Socket) => {
-                const clientConnection = new ClientConnection(this.client, addr, socket);
-
-                return this.initiateCommunication(clientConnection).then(() => {
-                    return clientConnection.registerResponseCallback(processResponseCallback);
-                }).then(() => {
-                    return this.authenticate(clientConnection, asOwner);
-                }).then(() => {
-                    this.establishedConnections[clientConnection.getAddress().toString()] = clientConnection;
-                    this.onConnectionOpened(clientConnection);
-                    connectionResolver.resolve(clientConnection);
-                });
-            }).catch((e: any) => {
+        this.retryConnection(address, asOwner)
+            .then((clientConnection) => {
+                this.establishedConnections[clientConnection.getAddress().toString()] = clientConnection;
+                this.onConnectionOpened(clientConnection);
+                connectionResolver.resolve(clientConnection);
+            })
+            .catch((e: any) => {
+                this.logger.error('ClientConnectionManager', 
+                    `Failed to establish connection to ${addressIndex}`, e);
                 connectionResolver.reject(e);
-            }).finally(() => {
+            })
+            .finally(() => {
                 delete this.pendingConnections[addressIndex];
             });
-        });
 
         const connectionTimeout = this.client.getConfig().networkConfig.connectionTimeout;
         if (connectionTimeout !== 0) {
@@ -136,12 +212,17 @@ export class ClientConnectionManager extends EventEmitter {
     }
 
     shutdown(): void {
+        if (this.connectionHealthCheckInterval) {
+            clearInterval(this.connectionHealthCheckInterval);
+        }
+        
         for (const pending in this.pendingConnections) {
             this.pendingConnections[pending].reject(new ClientNotActiveError('Client is shutting down!'));
         }
         for (const conn in this.establishedConnections) {
             this.establishedConnections[conn].close();
         }
+        this.failedConnections.clear();
     }
 
     private triggerConnect(address: Address, asOwner: boolean): Promise<net.Socket> {

@@ -142,6 +142,8 @@ export class InvocationService {
     private logger: ILogger;
     private cleanResourcesTask: Task;
     private isShutdown: boolean;
+    private readonly maxRetryAttempts: number = 10;
+    private readonly partitionFailureBackoff: number = 2000; // 2 seconds backoff for partition failures
 
     constructor(hazelcastClient: HazelcastClient) {
         this.client = hazelcastClient;
@@ -358,10 +360,32 @@ export class InvocationService {
 
     private invokeOnPartitionOwner(invocation: Invocation, partitionId: number): Promise<void> {
         const ownerAddress = this.client.getPartitionService().getAddressForPartition(partitionId);
+        if (!ownerAddress) {
+            // If we don't have partition information, refresh and retry
+            this.logger.debug('InvocationService', `No partition owner for partition ${partitionId}, refreshing partition table`);
+            return this.client.getPartitionService().refresh().then(() => {
+                const newOwnerAddress = this.client.getPartitionService().getAddressForPartition(partitionId);
+                if (!newOwnerAddress) {
+                    throw new Error(`Still no partition owner for partition ${partitionId} after refresh`);
+                }
+                return this.invokeOnAddress(invocation, newOwnerAddress);
+            });
+        }
+
         return this.client.getConnectionManager().getOrConnect(ownerAddress).then((connection: ClientConnection) => {
             return this.send(invocation, connection);
         }).catch((e) => {
-            this.logger.debug('InvocationService', e);
+            this.logger.debug('InvocationService', `Partition owner ${ownerAddress.toString()} unavailable for partition ${partitionId}:`, e);
+            
+            // If this is a partition-specific failure, refresh partition table and retry
+            if (invocation.hasPartitionId()) {
+                this.logger.debug('InvocationService', `Refreshing partition table due to partition owner failure`);
+                return this.client.getPartitionService().refresh().then(() => {
+                    // Retry the invocation with updated partition information
+                    return this.doInvoke(invocation);
+                });
+            }
+            
             throw new IOError(ownerAddress.toString() + '(partition owner) is not available.', e);
         });
     }
@@ -379,16 +403,34 @@ export class InvocationService {
 
     private notifyError(invocation: Invocation, error: Error): void {
         const correlationId = invocation.request.getCorrelationId();
+        
         if (this.rejectIfNotRetryable(invocation, error)) {
             this.pending.delete(correlationId);
             return;
         }
+
+        // Check if we've exceeded max retry attempts
+        if (invocation.invokeCount >= this.maxRetryAttempts) {
+            this.logger.error('InvocationService', 
+                `Max retry attempts (${this.maxRetryAttempts}) exceeded for correlation-id=${correlationId}`);
+            invocation.deferred.reject(new Error(`Max retry attempts exceeded: ${error.message}`));
+            this.pending.delete(correlationId);
+            return;
+        }
+
         this.logger.debug('InvocationService',
             'Retrying(' + invocation.invokeCount + ') on correlation-id=' + correlationId, error);
+        
+        // Use exponential backoff for partition failures
+        let retryDelay = this.getInvocationRetryPauseMillis();
+        if (invocation.hasPartitionId() && error instanceof IOError) {
+            retryDelay = this.partitionFailureBackoff;
+        }
+        
         if (invocation.invokeCount < MAX_FAST_INVOCATION_COUNT) {
             this.doInvoke(invocation);
         } else {
-            setTimeout(this.doInvoke.bind(this, invocation), this.getInvocationRetryPauseMillis());
+            setTimeout(this.doInvoke.bind(this, invocation), retryDelay);
         }
     }
 

@@ -31,6 +31,8 @@ export class PartitionService {
     private partitionRefreshTask: any;
     private isShutdown: boolean;
     private logger: ILogger;
+    private lastRefreshTime: number = 0;
+    private readonly minRefreshInterval: number = 2000; // Minimum 2 seconds between refreshes
 
     constructor(client: HazelcastClient) {
         this.client = client;
@@ -49,30 +51,51 @@ export class PartitionService {
     }
 
     /**
+     * Clears the partition table, forcing a refresh on next operation
+     */
+    clearPartitionTable(): void {
+        this.logger.info('PartitionService', 'Clearing partition table');
+        this.partitionMap = {};
+        this.partitionCount = 0;
+        this.lastRefreshTime = 0;
+    }
+
+    /**
      * Refreshes the internal partition table.
      */
     refresh(): Promise<void> {
         if (this.isShutdown) {
             return Promise.resolve();
         }
-        const ownerConnection = this.client.getClusterService().getOwnerConnection();
-        if (ownerConnection == null) {
+
+        const now = Date.now();
+        if (now - this.lastRefreshTime < this.minRefreshInterval) {
+            this.logger.debug('PartitionService', 'Skipping refresh, too soon since last refresh');
             return Promise.resolve();
         }
+
+        const ownerConnection = this.client.getClusterService().getOwnerConnection();
+        if (ownerConnection == null) {
+            this.logger.warn('PartitionService', 'Cannot refresh partitions, no owner connection available');
+            return Promise.resolve();
+        }
+
         const clientMessage: ClientMessage = GetPartitionsCodec.encodeRequest();
 
         return this.client.getInvocationService()
             .invokeOnConnection(ownerConnection, clientMessage)
             .then((response: ClientMessage) => {
                 const receivedPartitionMap = GetPartitionsCodec.decodeResponse(response);
-                for (const partitionId in receivedPartitionMap) {
-                    this.partitionMap[partitionId] = receivedPartitionMap[partitionId];
-                }
+                this.partitionMap = receivedPartitionMap;
                 this.partitionCount = Object.keys(this.partitionMap).length;
+                this.lastRefreshTime = now;
+                this.logger.debug('PartitionService', `Refreshed partition table with ${this.partitionCount} partitions`);
             }).catch((e) => {
                 if (this.client.getLifecycleService().isRunning()) {
                     this.logger.warn('PartitionService', 'Error while fetching cluster partition table from '
                         + this.client.getClusterService().ownerUuid, e);
+                    // If refresh fails, clear the table to force refresh on next operation
+                    this.clearPartitionTable();
                 }
             });
     }
@@ -83,7 +106,13 @@ export class PartitionService {
      * @returns the address of the node.
      */
     getAddressForPartition(partitionId: number): Address {
-        return this.partitionMap[partitionId];
+        const address = this.partitionMap[partitionId];
+        if (!address) {
+            this.logger.warn('PartitionService', `No address found for partition ${partitionId}, refreshing partition table`);
+            // Trigger a refresh if we don't have partition information
+            setImmediate(() => this.refresh());
+        }
+        return address;
     }
 
     /**
