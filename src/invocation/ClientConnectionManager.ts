@@ -144,9 +144,9 @@ export class ClientConnectionManager extends EventEmitter {
             if (retryCount < this.maxConnectionRetries) {
                 this.logger.warn('ClientConnectionManager', 
                     `Connection attempt ${retryCount + 1} failed for ${address.toString()}, retrying in ${this.connectionRetryDelay}ms`);
-                return new Promise((resolve) => {
+                return new Promise((resolve, reject) => {
                     setTimeout(() => {
-                        this.retryConnection(address, asOwner, retryCount + 1).then(resolve).catch(resolve);
+                        this.retryConnection(address, asOwner, retryCount + 1).then(resolve).catch(reject);
                     }, this.connectionRetryDelay);
                 });
             } else {
@@ -300,6 +300,14 @@ export class ClientConnectionManager extends EventEmitter {
 
         this.retryConnection(address, asOwner)
             .then((clientConnection) => {
+                // Safety check: ensure we got a proper ClientConnection
+                if (!clientConnection || typeof clientConnection.getAddress !== 'function') {
+                    const error = new Error(`Invalid connection object returned: ${typeof clientConnection}`);
+                    this.logger.error('ClientConnectionManager', error.message);
+                    connectionResolver.reject(error);
+                    return;
+                }
+                
                 this.establishedConnections[clientConnection.getAddress().toString()] = clientConnection;
                 this.onConnectionOpened(clientConnection);
                 connectionResolver.resolve(clientConnection);
