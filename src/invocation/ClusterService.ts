@@ -72,6 +72,7 @@ export class ClusterService {
         this.logger = this.client.getLoggingService().getLogger();
         this.members = [];
         this.startReconnectionTask();
+        this.startStateLoggingTask();
     }
 
     /**
@@ -263,6 +264,9 @@ export class ClusterService {
 
         this.logger.info('ClusterService', 'Starting failover process...');
         
+        // Log state before failover
+        this.logCurrentState();
+        
         // Clear any stale partition information
         this.client.getPartitionService().clearPartitionTable();
         
@@ -270,9 +274,11 @@ export class ClusterService {
         this.connectToCluster()
             .then(() => {
                 this.logger.info('ClusterService', 'Failover completed successfully');
+                this.logCurrentState(); // Log state after successful failover
             })
             .catch((error) => {
                 this.logger.error('ClusterService', 'Failover failed', error);
+                this.logCurrentState(); // Log state after failed failover
                 // If failover fails, shutdown the client to prevent further issues
                 this.client.shutdown();
             })
@@ -401,6 +407,10 @@ export class ClusterService {
         this.members = members;
         this.client.getPartitionService().refresh();
         this.logger.info('ClusterService', 'Members received.', this.members);
+        
+        // Log current state after member list update
+        this.logCurrentState();
+        
         const events = this.detectMembershipEvents(prevMembers);
         for (const event of events) {
             this.fireMembershipEvent(event);
@@ -471,9 +481,46 @@ export class ClusterService {
             const removedMemberList = this.members.splice(memberIndex, 1);
             assert(removedMemberList.length === 1);
         }
-        this.client.getConnectionManager().destroyConnection(member.address);
+        
+        // Don't automatically destroy connections during failover
+        if (!this.failoverInProgress) {
+            this.logger.info('ClusterService', `Member removed: ${member.address.toString()}, destroying connection`);
+            this.client.getConnectionManager().destroyConnection(member.address);
+        } else {
+            this.logger.debug('ClusterService', `Member removed during failover: ${member.address.toString()}, keeping connection for evaluation`);
+        }
+        
         const membershipEvent = new MembershipEvent(member, MemberEvent.REMOVED, this.members);
         this.fireMembershipEvent(membershipEvent);
+    }
+
+    /**
+     * Logs the current state for debugging purposes
+     */
+    private logCurrentState(): void {
+        const activeConnections = Object.keys(this.client.getConnectionManager().getEstablishedConnections()).length;
+        const memberCount = this.members.length;
+        const downAddressesCount = this.downAddresses.size;
+        const hasOwner = !!this.ownerConnection;
+        
+        this.logger.info('ClusterService', `Current State - Members: ${memberCount}, Active Connections: ${activeConnections}, Down Addresses: ${downAddressesCount}, Has Owner: ${hasOwner}`);
+        
+        if (this.ownerConnection) {
+            this.logger.info('ClusterService', `Owner Connection: ${this.ownerConnection.getAddress().toString()}, Alive: ${this.ownerConnection.isAlive()}`);
+        }
+        
+        // Log all active connections
+        const connections = this.client.getConnectionManager().getEstablishedConnections();
+        Object.keys(connections).forEach(addressStr => {
+            const connection = connections[addressStr];
+            this.logger.debug('ClusterService', `Connection to ${addressStr}: Alive=${connection.isAlive()}, Owner=${connection.isAuthenticatedAsOwner()}`);
+        });
+        
+        // Log down addresses
+        if (downAddressesCount > 0) {
+            const downAddresses = Array.from(this.downAddresses.keys());
+            this.logger.debug('ClusterService', `Down Addresses: ${downAddresses.join(', ')}`);
+        }
     }
 
     private startReconnectionTask(): void {
@@ -483,8 +530,22 @@ export class ClusterService {
         }, this.reconnectionInterval);
     }
 
+    /**
+     * Starts a periodic task to log the current state for debugging
+     */
+    private startStateLoggingTask(): void {
+        // Log state every 30 seconds for debugging
+        setInterval(() => {
+            if (this.client.getLifecycleService().isRunning()) {
+                this.logCurrentState();
+            }
+        }, 30000);
+    }
+
     private attemptReconnectionToFailedNodes(): void {
-        if (this.failoverInProgress || !this.ownerConnection) {
+        // Allow reconnection even during failover, but be more careful
+        if (this.failoverInProgress) {
+            this.logger.debug('ClusterService', 'Skipping reconnection attempt during failover');
             return;
         }
 
@@ -492,7 +553,7 @@ export class ClusterService {
         const addressesToReconnect: Address[] = [];
         const totalDownAddresses = this.downAddresses.size;
 
-        // If we have no down addresses, we can increase the reconnection interval
+        // If we have no down addresses, we can skip
         if (totalDownAddresses === 0) {
             return;
         }
@@ -507,6 +568,14 @@ export class ClusterService {
                     const port = parseInt(portStr, 10);
                     if (host && !isNaN(port)) {
                         const address = new Address(host, port);
+                        
+                        // Check if we already have a connection to this address
+                        if (this.client.getConnectionManager().hasConnection(address)) {
+                            this.logger.debug('ClusterService', `Already have active connection to ${addressStr}, removing from down addresses`);
+                            this.downAddresses.delete(addressStr);
+                            return;
+                        }
+                        
                         addressesToReconnect.push(address);
                     }
                 } catch (error) {
@@ -532,6 +601,9 @@ export class ClusterService {
             });
             this.logger.debug('ClusterService', `Still waiting for ${totalDownAddresses} addresses to unblock: ${remainingBlocked.join(', ')}`);
         }
+        
+        // Log current state after reconnection attempts
+        this.logCurrentState();
     }
 
     /**
@@ -540,6 +612,13 @@ export class ClusterService {
      */
     private attemptReconnectionToAddress(address: Address): void {
         const addressStr = address.toString();
+        
+        // Check if we already have a connection to this address
+        if (this.client.getConnectionManager().hasConnection(address)) {
+            this.logger.debug('ClusterService', `Already have active connection to ${addressStr}, skipping reconnection`);
+            this.downAddresses.delete(addressStr);
+            return;
+        }
         
         // Remove from down addresses to allow connection attempt
         this.downAddresses.delete(addressStr);
@@ -550,8 +629,13 @@ export class ClusterService {
             .then((connection: ClientConnection) => {
                 this.logger.info('ClusterService', `Successfully reconnected to ${addressStr}`);
                 
-                // Check if this reconnected node should become the new owner
-                this.evaluateOwnershipChange(address, connection);
+                // Only evaluate ownership change if we don't have an owner or current owner is unhealthy
+                if (!this.ownerConnection || !this.ownerConnection.isAlive()) {
+                    this.logger.info('ClusterService', `Evaluating ownership change for ${addressStr}`);
+                    this.evaluateOwnershipChange(address, connection);
+                } else {
+                    this.logger.debug('ClusterService', `Keeping ${addressStr} as member connection, current owner is healthy`);
+                }
                 
                 // Trigger partition service refresh to update routing information
                 this.client.getPartitionService().refresh();
@@ -585,12 +669,8 @@ export class ClusterService {
             return;
         }
 
-        // Check if this reconnected node was previously our owner (by checking if it's in our known addresses)
-        const wasPreviousOwner = this.knownAddresses.some(knownAddr => knownAddr.equals(address));
-        if (wasPreviousOwner) {
-            this.logger.debug('ClusterService', `Reconnected node ${address.toString()} was previously known, monitoring for ownership opportunity`);
-            // Don't switch ownership immediately, but keep the connection for potential future use
-        }
+        // Don't switch ownership if current owner is healthy
+        this.logger.debug('ClusterService', `Current owner is healthy, keeping ${address.toString()} as member connection`);
     }
 
     /**

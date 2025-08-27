@@ -102,6 +102,20 @@ export class ClientConnectionManager extends EventEmitter {
                 this.destroyConnection(connection.getAddress());
             }
         });
+        
+        // Log current connection state
+        const activeConnections = Object.keys(this.establishedConnections).length;
+        const pendingConnections = Object.keys(this.pendingConnections).length;
+        const failedConnections = this.failedConnections.size;
+        
+        this.logger.debug('ClientConnectionManager', `Connection State - Active: ${activeConnections}, Pending: ${pendingConnections}, Failed: ${failedConnections}`);
+        
+        if (activeConnections > 0) {
+            Object.keys(this.establishedConnections).forEach(addressStr => {
+                const connection = this.establishedConnections[addressStr];
+                this.logger.debug('ClientConnectionManager', `Connection to ${addressStr}: Alive=${connection.isAlive()}, Owner=${connection.isAuthenticatedAsOwner()}`);
+            });
+        }
     }
 
     private checkConnectionHealth(): void {
@@ -167,6 +181,35 @@ export class ClientConnectionManager extends EventEmitter {
     }
 
     getActiveConnections(): { [address: string]: ClientConnection } {
+        return this.establishedConnections;
+    }
+
+    /**
+     * Checks if we already have a connection to the given address
+     * @param address The address to check
+     * @returns true if connection exists and is healthy, false otherwise
+     */
+    hasConnection(address: Address): boolean {
+        const addressStr = address.toString();
+        const connection = this.establishedConnections[addressStr];
+        return connection && connection.isAlive();
+    }
+
+    /**
+     * Gets an existing connection to a specific address if it exists
+     * @param address The address to check for existing connection
+     * @returns The existing connection or undefined if none exists
+     */
+    getConnection(address: Address): ClientConnection | undefined {
+        const addressStr = address.toString();
+        return this.establishedConnections[addressStr];
+    }
+
+    /**
+     * Gets all established connections
+     * @returns Object containing all established connections
+     */
+    getEstablishedConnections(): { [address: string]: ClientConnection } {
         return this.establishedConnections;
     }
 
