@@ -132,8 +132,8 @@ export class ClientConnectionManager extends EventEmitter {
     }
 
     private isConnectionHealthy(connection: ClientConnection): boolean {
-        // Only check if connection is alive - isAuthenticated() method doesn't exist
-        return connection.isAlive();
+        // Use the improved health check method
+        return connection.isHealthy();
     }
 
     private retryConnection(address: Address, asOwner: boolean, retryCount: number = 0): Promise<ClientConnection> {
@@ -196,6 +196,45 @@ export class ClientConnectionManager extends EventEmitter {
     }
 
     /**
+     * Forces cleanup of all dead connections
+     * This is useful during failover to prevent connection leakage
+     */
+    forceCleanupDeadConnections(): void {
+        this.logger.info('ClientConnectionManager', 'Forcing cleanup of all dead connections');
+        
+        const addressesToRemove: string[] = [];
+        
+        // Check all established connections
+        Object.keys(this.establishedConnections).forEach(addressStr => {
+            const connection = this.establishedConnections[addressStr];
+            if (connection && !connection.isHealthy()) {
+                this.logger.warn('ClientConnectionManager', `Found dead connection to ${addressStr}, marking for cleanup`);
+                addressesToRemove.push(addressStr);
+            }
+        });
+        
+        // Remove dead connections
+        addressesToRemove.forEach(addressStr => {
+            const connection = this.establishedConnections[addressStr];
+            if (connection) {
+                this.destroyConnection(connection.getAddress());
+            }
+        });
+        
+        // Also clean up any pending connections that might be stuck
+        Object.keys(this.pendingConnections).forEach(addressStr => {
+            const pendingConnection = this.pendingConnections[addressStr];
+            if (pendingConnection) {
+                this.logger.warn('ClientConnectionManager', `Cleaning up stuck pending connection to ${addressStr}`);
+                pendingConnection.reject(new Error('Connection cleanup forced'));
+                delete this.pendingConnections[addressStr];
+            }
+        });
+        
+        this.logger.info('ClientConnectionManager', `Cleanup completed. Removed ${addressesToRemove.length} dead connections`);
+    }
+
+    /**
      * Gets an existing connection to a specific address if it exists
      * @param address The address to check for existing connection
      * @returns The existing connection or undefined if none exists
@@ -211,6 +250,14 @@ export class ClientConnectionManager extends EventEmitter {
      */
     getEstablishedConnections(): { [address: string]: ClientConnection } {
         return this.establishedConnections;
+    }
+
+    /**
+     * Gets all pending connections
+     * @returns Object containing all pending connections
+     */
+    getPendingConnections(): { [address: string]: Promise.Resolver<ClientConnection> } {
+        return this.pendingConnections;
     }
 
     /**

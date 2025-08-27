@@ -215,6 +215,7 @@ export class ClientConnection {
     private readonly socket: net.Socket;
     private readonly writer: PipelinedWriter | DirectWriter;
     private readonly reader: FrameReader;
+    private readonly logger: any; // Logger for connection state tracking
 
     constructor(client: HazelcastClient, address: Address, socket: net.Socket) {
         const enablePipelining = client.getConfig().properties[PROPERTY_PIPELINING_ENABLED] as boolean;
@@ -235,6 +236,39 @@ export class ClientConnection {
             this.lastWriteTimeMillis = Date.now();
         });
         this.reader = new FrameReader();
+        this.logger = client.getLoggingService().getLogger();
+        
+        // Add socket event handlers for proper connection state tracking
+        this.setupSocketEventHandlers();
+    }
+
+    /**
+     * Sets up socket event handlers for proper connection state tracking
+     */
+    private setupSocketEventHandlers(): void {
+        // Handle socket close events
+        this.socket.on('close', () => {
+            this.closedTime = Date.now();
+            this.logger.debug('ClientConnection', `Socket closed for ${this.address.toString()}`);
+        });
+
+        // Handle socket end events
+        this.socket.on('end', () => {
+            this.closedTime = Date.now();
+            this.logger.debug('ClientConnection', `Socket ended by remote for ${this.address.toString()}`);
+        });
+
+        // Handle socket errors
+        this.socket.on('error', (error: Error) => {
+            this.logger.warn('ClientConnection', `Socket error for ${this.address.toString()}:`, error);
+            // Don't set closedTime here as the socket might still be usable
+        });
+
+        // Handle socket timeout
+        this.socket.on('timeout', () => {
+            this.logger.warn('ClientConnection', `Socket timeout for ${this.address.toString()}`);
+            // Don't set closedTime here as the socket might still be usable
+        });
     }
 
     /**
@@ -280,8 +314,49 @@ export class ClientConnection {
         this.closedTime = Date.now();
     }
 
+    /**
+     * Checks if the connection is alive and healthy
+     * @returns true if connection is alive, false otherwise
+     */
     isAlive(): boolean {
-        return this.closedTime === 0;
+        // Check if we've explicitly closed the connection
+        if (this.closedTime !== 0) {
+            return false;
+        }
+        
+        // Check if the underlying socket is still connected
+        if (!this.socket || this.socket.destroyed) {
+            return false;
+        }
+        
+        // Check if the socket is writable (indicates it's still connected)
+        if (!this.socket.writable) {
+            return false;
+        }
+        
+        // Check if we've received data recently (within last 30 seconds)
+        const now = Date.now();
+        const lastReadThreshold = 30000; // 30 seconds
+        if (this.lastReadTimeMillis > 0 && (now - this.lastReadTimeMillis) > lastReadThreshold) {
+            // If we haven't received data for a while, the connection might be stale
+            return false;
+        }
+        
+        return true;
+    }
+
+    /**
+     * Performs a more thorough health check of the connection
+     * @returns true if connection is healthy, false otherwise
+     */
+    isHealthy(): boolean {
+        if (!this.isAlive()) {
+            return false;
+        }
+        
+        // Additional health checks can be added here
+        // For now, just check if we're still heartbeating
+        return this.isHeartbeating();
     }
 
     isHeartbeating(): boolean {

@@ -267,6 +267,9 @@ export class ClusterService {
         // Log state before failover
         this.logCurrentState();
         
+        // Force cleanup of all dead connections to prevent leakage
+        this.client.getConnectionManager().forceCleanupDeadConnections();
+        
         // Clear any stale partition information
         this.client.getPartitionService().clearPartitionTable();
         
@@ -482,12 +485,26 @@ export class ClusterService {
             assert(removedMemberList.length === 1);
         }
         
-        // Don't automatically destroy connections during failover
-        if (!this.failoverInProgress) {
-            this.logger.info('ClusterService', `Member removed: ${member.address.toString()}, destroying connection`);
-            this.client.getConnectionManager().destroyConnection(member.address);
+        // Check if we have a healthy connection to this member
+        const connectionManager = this.client.getConnectionManager();
+        const existingConnection = connectionManager.getConnection(member.address);
+        
+        if (existingConnection && existingConnection.isHealthy()) {
+            // If the connection is healthy, don't destroy it immediately
+            // This prevents unnecessary disconnections during temporary network issues
+            this.logger.info('ClusterService', `Member removed but connection is healthy: ${member.address.toString()}, preserving connection`);
+            
+            // Only destroy if we're not in failover mode
+            if (!this.failoverInProgress) {
+                this.logger.debug('ClusterService', `Destroying healthy connection to removed member: ${member.address.toString()}`);
+                connectionManager.destroyConnection(member.address);
+            } else {
+                this.logger.debug('ClusterService', `Preserving healthy connection during failover: ${member.address.toString()}`);
+            }
         } else {
-            this.logger.debug('ClusterService', `Member removed during failover: ${member.address.toString()}, keeping connection for evaluation`);
+            // If connection is unhealthy, destroy it
+            this.logger.info('ClusterService', `Member removed with unhealthy connection: ${member.address.toString()}, destroying connection`);
+            connectionManager.destroyConnection(member.address);
         }
         
         const membershipEvent = new MembershipEvent(member, MemberEvent.REMOVED, this.members);
@@ -620,6 +637,16 @@ export class ClusterService {
             return;
         }
         
+        // Check if we're already trying to connect to this address
+        const connectionManager = this.client.getConnectionManager();
+        const establishedConnections = connectionManager.getEstablishedConnections();
+        const pendingConnections = Object.keys(connectionManager.getPendingConnections || {}).length;
+        
+        if (pendingConnections > 0) {
+            this.logger.debug('ClusterService', `Already have pending connections, skipping reconnection to ${addressStr}`);
+            return;
+        }
+        
         // Remove from down addresses to allow connection attempt
         this.downAddresses.delete(addressStr);
         this.logger.debug('ClusterService', `Attempting reconnection to ${addressStr}`);
@@ -630,7 +657,7 @@ export class ClusterService {
                 this.logger.info('ClusterService', `Successfully reconnected to ${addressStr}`);
                 
                 // Only evaluate ownership change if we don't have an owner or current owner is unhealthy
-                if (!this.ownerConnection || !this.ownerConnection.isAlive()) {
+                if (!this.ownerConnection || !this.ownerConnection.isHealthy()) {
                     this.logger.info('ClusterService', `Evaluating ownership change for ${addressStr}`);
                     this.evaluateOwnershipChange(address, connection);
                 } else {
