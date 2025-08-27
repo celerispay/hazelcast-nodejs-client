@@ -141,6 +141,21 @@ export class ClientConnectionManager extends EventEmitter {
             this.failedConnections.delete(address.toString());
             return connection;
         }).catch((error) => {
+            // Check if it's an authentication error
+            const isAuthError = error.message && (
+                error.message.includes('Invalid Credentials') ||
+                error.message.includes('authentication') ||
+                error.message.includes('credentials')
+            );
+            
+            if (isAuthError) {
+                this.logger.error('ClientConnectionManager', 
+                    `Authentication failed for ${address.toString()}, not retrying: ${error.message}`);
+                // Handle authentication errors specially
+                this.handleAuthenticationError(address);
+                throw error;
+            }
+            
             if (retryCount < this.maxConnectionRetries) {
                 this.logger.warn('ClientConnectionManager', 
                     `Connection attempt ${retryCount + 1} failed for ${address.toString()}, retrying in ${this.connectionRetryDelay}ms`);
@@ -366,7 +381,7 @@ export class ClientConnectionManager extends EventEmitter {
 
     /**
      * Cleans up all connections to a specific address during failover
-     * @param address
+     * @param address The address to cleanup
      */
     cleanupConnectionsForFailover(address: Address): void {
         const addressStr = address.toString();
@@ -378,6 +393,32 @@ export class ClientConnectionManager extends EventEmitter {
         
         // Remove from failed connections to allow reconnection after failover
         this.failedConnections.delete(addressStr);
+    }
+
+    /**
+     * Handles authentication errors by clearing failed connections and allowing retry
+     * @param address The address that had authentication issues
+     */
+    handleAuthenticationError(address: Address): void {
+        const addressStr = address.toString();
+        
+        this.logger.warn('ClientConnectionManager', `Handling authentication error for ${addressStr}`);
+        
+        // Clear from failed connections to allow retry with fresh credentials
+        this.failedConnections.delete(addressStr);
+        
+        // Also clear any established connections to this address
+        if (this.establishedConnections.hasOwnProperty(addressStr)) {
+            this.logger.info('ClientConnectionManager', `Clearing established connection to ${addressStr} due to auth error`);
+            this.destroyConnection(address);
+        }
+        
+        // Clear any pending connections
+        if (this.pendingConnections.hasOwnProperty(addressStr)) {
+            this.logger.info('ClientConnectionManager', `Clearing pending connection to ${addressStr} due to auth error`);
+            this.pendingConnections[addressStr].reject(new Error('Authentication error, connection cleared'));
+            delete this.pendingConnections[addressStr];
+        }
     }
 
     shutdown(): void {

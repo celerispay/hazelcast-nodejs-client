@@ -63,7 +63,7 @@ export class ClusterService {
     private lastFailoverAttempt: number = 0;
     private readonly failoverCooldown: number = 5000; // 5 seconds cooldown between failover attempts
     private downAddresses: Map<string, number> = new Map(); // address -> timestamp when marked down
-    private readonly addressBlockDuration: number = 30000; // 30 seconds block duration for down addresses
+    private readonly addressBlockDuration: number = 15000; // Reduced from 30000ms to 15000ms
     private reconnectionTask: any = null;
     private readonly reconnectionInterval: number = 10000; // 10 seconds between reconnection attempts
 
@@ -281,13 +281,53 @@ export class ClusterService {
             })
             .catch((error) => {
                 this.logger.error('ClusterService', 'Failover failed', error);
+                
+                // If failover fails, try to unblock at least one address to allow recovery
+                this.attemptEmergencyRecovery();
+                
                 this.logCurrentState(); // Log state after failed failover
-                // If failover fails, shutdown the client to prevent further issues
-                this.client.shutdown();
+                // Don't shutdown immediately, give recovery a chance
             })
             .finally(() => {
                 this.failoverInProgress = false;
             });
+    }
+
+    /**
+     * Attempts emergency recovery when failover fails
+     */
+    private attemptEmergencyRecovery(): void {
+        this.logger.warn('ClusterService', 'Attempting emergency recovery...');
+        
+        // Unblock at least one address to allow recovery
+        if (this.downAddresses.size > 0) {
+            const firstBlockedAddress = Array.from(this.downAddresses.keys())[0];
+            this.logger.info('ClusterService', `Emergency unblocking address ${firstBlockedAddress}`);
+            this.downAddresses.delete(firstBlockedAddress);
+            
+            // Try to connect to the unblocked address
+            try {
+                const [host, portStr] = firstBlockedAddress.split(':');
+                const port = parseInt(portStr, 10);
+                if (host && !isNaN(port)) {
+                    const address = new Address(host, port);
+                    this.logger.info('ClusterService', `Attempting emergency connection to ${firstBlockedAddress}`);
+                    
+                    // Try to connect without blocking
+                    this.client.getConnectionManager().getOrConnect(address, false)
+                        .then((connection: ClientConnection) => {
+                            this.logger.info('ClusterService', `Emergency connection successful to ${firstBlockedAddress}`);
+                            this.evaluateOwnershipChange(address, connection);
+                            this.client.getPartitionService().refresh();
+                        })
+                        .catch((error) => {
+                            this.logger.warn('ClusterService', `Emergency connection failed to ${firstBlockedAddress}:`, error);
+                        });
+                }
+            } catch (error) {
+                this.logger.error('ClusterService', 'Error during emergency recovery:', error);
+            }
+        }
     }
 
     private isAddressKnownDown(address: Address): boolean {
@@ -737,6 +777,20 @@ export class ClusterService {
     private markAddressAsDownWithDuration(address: Address, blockDuration: number): void {
         const addressStr = address.toString();
         const now = Date.now();
+        
+        // Don't block if we already have a healthy connection to this address
+        if (this.client.getConnectionManager().hasConnection(address)) {
+            this.logger.debug('ClusterService', `Not blocking ${addressStr} as we have a healthy connection`);
+            return;
+        }
+        
+        // Don't block if this would leave us with no available nodes
+        const totalDownAddresses = this.downAddresses.size;
+        const totalMembers = this.members.length;
+        if (totalDownAddresses >= totalMembers - 1) {
+            this.logger.warn('ClusterService', `Not blocking ${addressStr} as it would leave us with no available nodes`);
+            return;
+        }
         
         this.downAddresses.set(addressStr, now);
         this.logger.warn('ClusterService', `Marked address ${addressStr} as down, will be blocked for ${blockDuration}ms`);
