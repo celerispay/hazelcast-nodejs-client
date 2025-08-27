@@ -2,7 +2,7 @@ const assert = require('assert');
 const { ClientConfig } = require('../lib/config/Config');
 const { ClientNetworkConfig } = require('../lib/config/ClientNetworkConfig');
 
-describe('Connection Failover Test - Version 3.12.5 (@celerispay)', function() {
+describe('Connection Failover Test - Version 3.12.5-1 (@celerispay)', function() {
     let config;
 
     beforeEach(function() {
