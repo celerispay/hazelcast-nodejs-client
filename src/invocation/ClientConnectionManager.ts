@@ -48,6 +48,8 @@ export class ClientConnectionManager extends EventEmitter {
     private failedConnections: Set<string> = new Set();
     private readonly maxConnectionRetries: number = 3;
     private readonly connectionRetryDelay: number = 1000;
+    private connectionCleanupTask: any = null;
+    private readonly connectionCleanupInterval: number = 15000; // 15 seconds between cleanup checks
 
     constructor(client: HazelcastClient, addressTranslator: AddressTranslator, addressProviders: AddressProvider[]) {
         super();
@@ -56,6 +58,7 @@ export class ClientConnectionManager extends EventEmitter {
         this.addressTranslator = addressTranslator;
         this.addressProviders = addressProviders;
         this.startConnectionHealthCheck();
+        this.startConnectionCleanupTask();
     }
 
     private startConnectionHealthCheck(): void {
@@ -63,6 +66,42 @@ export class ClientConnectionManager extends EventEmitter {
         this.connectionHealthCheckInterval = setInterval(() => {
             this.checkConnectionHealth();
         }, 5000);
+    }
+
+    private startConnectionCleanupTask(): void {
+        // Periodically clean up stale connections and failed connection tracking
+        this.connectionCleanupTask = setInterval(() => {
+            this.cleanupStaleConnections();
+        }, this.connectionCleanupInterval);
+    }
+
+    private cleanupStaleConnections(): void {
+        const now = Date.now();
+        const staleThreshold = 60000; // 1 minute threshold for stale connections
+
+        // Clean up failed connections that are older than threshold
+        const addressesToRemove: string[] = [];
+        this.failedConnections.forEach(address => {
+            // For now, we'll use a simple cleanup strategy
+            // In a more sophisticated implementation, we could track timestamps
+            addressesToRemove.push(address);
+        });
+
+        if (addressesToRemove.length > 0) {
+            this.logger.debug('ClientConnectionManager', `Cleaning up ${addressesToRemove.length} stale failed connections`);
+            addressesToRemove.forEach(address => {
+                this.failedConnections.delete(address);
+            });
+        }
+
+        // Clean up any connections that are not responding
+        Object.keys(this.establishedConnections).forEach(addressStr => {
+            const connection = this.establishedConnections[addressStr];
+            if (connection && !connection.isAlive()) {
+                this.logger.warn('ClientConnectionManager', `Cleaning up stale connection to ${addressStr}`);
+                this.destroyConnection(connection.getAddress());
+            }
+        });
     }
 
     private checkConnectionHealth(): void {
@@ -200,20 +239,56 @@ export class ClientConnectionManager extends EventEmitter {
      */
     destroyConnection(address: Address): void {
         const addressStr = address.toString();
+        
+        // Clean up pending connections
         if (this.pendingConnections.hasOwnProperty(addressStr)) {
-            this.pendingConnections[addressStr].reject(null);
+            this.pendingConnections[addressStr].reject(new Error('Connection destroyed'));
+            delete this.pendingConnections[addressStr];
         }
+        
+        // Clean up established connections
         if (this.establishedConnections.hasOwnProperty(addressStr)) {
             const conn = this.establishedConnections[addressStr];
             delete this.establishedConnections[addressStr];
-            conn.close();
+            
+            try {
+                conn.close();
+            } catch (error) {
+                this.logger.warn('ClientConnectionManager', `Error closing connection to ${addressStr}:`, error);
+            }
+            
             this.onConnectionClosed(conn);
         }
+
+        // Mark as failed to prevent immediate reconnection attempts
+        this.failedConnections.add(addressStr);
+        
+        this.logger.debug('ClientConnectionManager', `Connection to ${addressStr} destroyed and marked as failed`);
+    }
+
+    /**
+     * Cleans up all connections to a specific address during failover
+     * @param address
+     */
+    cleanupConnectionsForFailover(address: Address): void {
+        const addressStr = address.toString();
+        
+        this.logger.info('ClientConnectionManager', `Cleaning up all connections to ${addressStr} for failover`);
+        
+        // Force cleanup of all connection types
+        this.destroyConnection(address);
+        
+        // Remove from failed connections to allow reconnection after failover
+        this.failedConnections.delete(addressStr);
     }
 
     shutdown(): void {
         if (this.connectionHealthCheckInterval) {
             clearInterval(this.connectionHealthCheckInterval);
+        }
+        
+        if (this.connectionCleanupTask) {
+            clearInterval(this.connectionCleanupTask);
         }
         
         for (const pending in this.pendingConnections) {

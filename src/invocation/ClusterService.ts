@@ -64,11 +64,14 @@ export class ClusterService {
     private readonly failoverCooldown: number = 5000; // 5 seconds cooldown between failover attempts
     private downAddresses: Map<string, number> = new Map(); // address -> timestamp when marked down
     private readonly addressBlockDuration: number = 30000; // 30 seconds block duration for down addresses
+    private reconnectionTask: any = null;
+    private readonly reconnectionInterval: number = 10000; // 10 seconds between reconnection attempts
 
     constructor(client: HazelcastClient) {
         this.client = client;
         this.logger = this.client.getLoggingService().getLogger();
         this.members = [];
+        this.startReconnectionTask();
     }
 
     /**
@@ -225,6 +228,10 @@ export class ClusterService {
 
     private onConnectionClosed(connection: ClientConnection): void {
         this.logger.warn('ClusterService', 'Connection closed to ' + connection.toString());
+        
+        // Mark the address as down when connection is closed
+        this.markAddressAsDown(connection.getAddress());
+        
         if (connection.isAuthenticatedAsOwner()) {
             this.ownerConnection = null;
             this.triggerFailover();
@@ -233,6 +240,10 @@ export class ClusterService {
 
     private onHeartbeatStopped(connection: ClientConnection): void {
         this.logger.warn('ClusterService', connection.toString() + ' stopped heartbeating.');
+        
+        // Mark the address as down when heartbeat stops
+        this.markAddressAsDown(connection.getAddress());
+        
         if (connection.isAuthenticatedAsOwner()) {
             this.client.getConnectionManager().destroyConnection(connection.getAddress());
             this.ownerConnection = null;
@@ -463,5 +474,180 @@ export class ClusterService {
         this.client.getConnectionManager().destroyConnection(member.address);
         const membershipEvent = new MembershipEvent(member, MemberEvent.REMOVED, this.members);
         this.fireMembershipEvent(membershipEvent);
+    }
+
+    private startReconnectionTask(): void {
+        // Periodically attempt to reconnect to previously failed addresses
+        this.reconnectionTask = setInterval(() => {
+            this.attemptReconnectionToFailedNodes();
+        }, this.reconnectionInterval);
+    }
+
+    private attemptReconnectionToFailedNodes(): void {
+        if (this.failoverInProgress || !this.ownerConnection) {
+            return;
+        }
+
+        const now = Date.now();
+        const addressesToReconnect: Address[] = [];
+        const totalDownAddresses = this.downAddresses.size;
+
+        // If we have no down addresses, we can increase the reconnection interval
+        if (totalDownAddresses === 0) {
+            return;
+        }
+
+        // Find addresses that are no longer blocked
+        this.downAddresses.forEach((downTime, addressStr) => {
+            const timeSinceDown = now - downTime;
+            if (timeSinceDown > this.addressBlockDuration) {
+                // Parse the address string back to Address object
+                try {
+                    const [host, portStr] = addressStr.split(':');
+                    const port = parseInt(portStr, 10);
+                    if (host && !isNaN(port)) {
+                        const address = new Address(host, port);
+                        addressesToReconnect.push(address);
+                    }
+                } catch (error) {
+                    this.logger.warn('ClusterService', `Failed to parse address ${addressStr} for reconnection:`, error);
+                }
+            }
+        });
+
+        if (addressesToReconnect.length > 0) {
+            this.logger.info('ClusterService', `Attempting to reconnect to ${addressesToReconnect.length} previously failed nodes: ${addressesToReconnect.map(addr => addr.toString()).join(', ')}`);
+            
+            // Attempt to establish connections to each unblocked address
+            addressesToReconnect.forEach(address => {
+                this.attemptReconnectionToAddress(address);
+            });
+        } else if (totalDownAddresses > 0) {
+            // Log remaining blocked addresses for debugging
+            const remainingBlocked = Array.from(this.downAddresses.keys()).map(addr => {
+                const downTime = this.downAddresses.get(addr);
+                const timeSinceDown = now - downTime;
+                const remainingTime = Math.max(0, this.addressBlockDuration - timeSinceDown);
+                return `${addr} (${Math.ceil(remainingTime / 1000)}s remaining)`;
+            });
+            this.logger.debug('ClusterService', `Still waiting for ${totalDownAddresses} addresses to unblock: ${remainingBlocked.join(', ')}`);
+        }
+    }
+
+    /**
+     * Attempts to establish a connection to a specific address
+     * @param address The address to reconnect to
+     */
+    private attemptReconnectionToAddress(address: Address): void {
+        const addressStr = address.toString();
+        
+        // Remove from down addresses to allow connection attempt
+        this.downAddresses.delete(addressStr);
+        this.logger.debug('ClusterService', `Attempting reconnection to ${addressStr}`);
+        
+        // Attempt to establish connection (not as owner, just as regular member connection)
+        this.client.getConnectionManager().getOrConnect(address, false)
+            .then((connection: ClientConnection) => {
+                this.logger.info('ClusterService', `Successfully reconnected to ${addressStr}`);
+                
+                // Check if this reconnected node should become the new owner
+                this.evaluateOwnershipChange(address, connection);
+                
+                // Trigger partition service refresh to update routing information
+                this.client.getPartitionService().refresh();
+                
+            }).catch((error) => {
+                this.logger.warn('ClusterService', `Reconnection attempt to ${addressStr} failed:`, error);
+                
+                // Mark the address as down again, but with a shorter block duration for reconnection attempts
+                const shorterBlockDuration = Math.min(this.addressBlockDuration / 2, 15000); // Max 15 seconds
+                this.markAddressAsDownWithDuration(address, shorterBlockDuration);
+            });
+    }
+
+    /**
+     * Evaluates whether we should switch ownership to a reconnected node
+     * @param address The address of the reconnected node
+     * @param connection The connection to the reconnected node
+     */
+    private evaluateOwnershipChange(address: Address, connection: ClientConnection): void {
+        // If we don't have an owner connection, this reconnected node becomes the owner
+        if (!this.ownerConnection) {
+            this.logger.info('ClusterService', `Promoting reconnected node ${address.toString()} to owner status`);
+            this.promoteToOwner(connection, address);
+            return;
+        }
+
+        // If our current owner connection is having issues, consider switching
+        if (this.ownerConnection && !this.ownerConnection.isAlive()) {
+            this.logger.info('ClusterService', `Current owner is unhealthy, switching to reconnected node ${address.toString()}`);
+            this.promoteToOwner(connection, address);
+            return;
+        }
+
+        // Check if this reconnected node was previously our owner (by checking if it's in our known addresses)
+        const wasPreviousOwner = this.knownAddresses.some(knownAddr => knownAddr.equals(address));
+        if (wasPreviousOwner) {
+            this.logger.debug('ClusterService', `Reconnected node ${address.toString()} was previously known, monitoring for ownership opportunity`);
+            // Don't switch ownership immediately, but keep the connection for potential future use
+        }
+    }
+
+    /**
+     * Promotes a connection to owner status
+     * @param connection The connection to promote
+     * @param address The address of the promoted connection
+     */
+    private promoteToOwner(connection: ClientConnection, address: Address): void {
+        try {
+            // Close the old owner connection if it exists
+            if (this.ownerConnection && this.ownerConnection !== connection) {
+                this.logger.info('ClusterService', `Closing previous owner connection to ${this.ownerConnection.getAddress().toString()}`);
+                this.client.getConnectionManager().destroyConnection(this.ownerConnection.getAddress());
+            }
+
+            // Set the new owner connection
+            connection.setAuthenticatedAsOwner(true);
+            this.ownerConnection = connection;
+            
+            this.logger.info('ClusterService', `Successfully promoted ${address.toString()} to owner status`);
+            
+            // Refresh partition information with the new owner
+            this.client.getPartitionService().refresh();
+            
+        } catch (error) {
+            this.logger.error('ClusterService', `Failed to promote ${address.toString()} to owner:`, error);
+            // If promotion fails, mark the address as down again
+            this.markAddressAsDown(address);
+        }
+    }
+
+    /**
+     * Marks an address as down with a custom block duration
+     * @param address The address to mark as down
+     * @param blockDuration The duration to block the address (in milliseconds)
+     */
+    private markAddressAsDownWithDuration(address: Address, blockDuration: number): void {
+        const addressStr = address.toString();
+        const now = Date.now();
+        
+        this.downAddresses.set(addressStr, now);
+        this.logger.warn('ClusterService', `Marked address ${addressStr} as down, will be blocked for ${blockDuration}ms`);
+        
+        // Schedule cleanup of this address after block duration
+        setTimeout(() => {
+            if (this.downAddresses.has(addressStr)) {
+                this.logger.info('ClusterService', `Unblocking address ${addressStr} after block duration`);
+                this.downAddresses.delete(addressStr);
+            }
+        }, blockDuration);
+    }
+
+    shutdown(): void {
+        if (this.reconnectionTask) {
+            clearInterval(this.reconnectionTask);
+            this.reconnectionTask = null;
+        }
+        this.downAddresses.clear();
     }
 }

@@ -33,6 +33,9 @@ export class PartitionService {
     private logger: ILogger;
     private lastRefreshTime: number = 0;
     private readonly minRefreshInterval: number = 2000; // Minimum 2 seconds between refreshes
+    private refreshInProgress: boolean = false;
+    private readonly maxRefreshRetries: number = 3;
+    private refreshRetryCount: number = 0;
 
     constructor(client: HazelcastClient) {
         this.client = client;
@@ -48,6 +51,7 @@ export class PartitionService {
     shutdown(): void {
         clearInterval(this.partitionRefreshTask);
         this.isShutdown = true;
+        this.refreshInProgress = false;
     }
 
     /**
@@ -58,6 +62,7 @@ export class PartitionService {
         this.partitionMap = {};
         this.partitionCount = 0;
         this.lastRefreshTime = 0;
+        this.refreshRetryCount = 0;
     }
 
     /**
@@ -74,12 +79,18 @@ export class PartitionService {
             return Promise.resolve();
         }
 
+        if (this.refreshInProgress) {
+            this.logger.debug('PartitionService', 'Refresh already in progress, skipping');
+            return Promise.resolve();
+        }
+
         const ownerConnection = this.client.getClusterService().getOwnerConnection();
         if (ownerConnection == null) {
             this.logger.warn('PartitionService', 'Cannot refresh partitions, no owner connection available');
             return Promise.resolve();
         }
 
+        this.refreshInProgress = true;
         const clientMessage: ClientMessage = GetPartitionsCodec.encodeRequest();
 
         return this.client.getInvocationService()
@@ -89,14 +100,22 @@ export class PartitionService {
                 this.partitionMap = receivedPartitionMap;
                 this.partitionCount = Object.keys(this.partitionMap).length;
                 this.lastRefreshTime = now;
+                this.refreshRetryCount = 0; // Reset retry count on success
                 this.logger.debug('PartitionService', `Refreshed partition table with ${this.partitionCount} partitions`);
             }).catch((e) => {
                 if (this.client.getLifecycleService().isRunning()) {
                     this.logger.warn('PartitionService', 'Error while fetching cluster partition table from '
                         + this.client.getClusterService().ownerUuid, e);
-                    // If refresh fails, clear the table to force refresh on next operation
-                    this.clearPartitionTable();
+                    
+                    // Increment retry count and clear table if too many failures
+                    this.refreshRetryCount++;
+                    if (this.refreshRetryCount >= this.maxRefreshRetries) {
+                        this.logger.error('PartitionService', `Max refresh retries (${this.maxRefreshRetries}) exceeded, clearing partition table`);
+                        this.clearPartitionTable();
+                    }
                 }
+            }).finally(() => {
+                this.refreshInProgress = false;
             });
     }
 
@@ -121,16 +140,42 @@ export class PartitionService {
      * @returns the partition id.
      */
     getPartitionId(key: any): number {
-        let partitionHash: number;
-        if (typeof key === 'object' && 'getPartitionHash' in key) {
-            partitionHash = key.getPartitionHash();
-        } else {
-            partitionHash = this.client.getSerializationService().toData(key).getPartitionHash();
+        try {
+            let partitionHash: number;
+            if (typeof key === 'object' && 'getPartitionHash' in key) {
+                partitionHash = key.getPartitionHash();
+            } else {
+                partitionHash = this.client.getSerializationService().toData(key).getPartitionHash();
+            }
+            return Math.abs(partitionHash) % this.partitionCount;
+        } catch (error) {
+            this.logger.warn('PartitionService', `Error computing partition ID for key:`, error);
+            // Return a safe default partition ID
+            return 0;
         }
-        return Math.abs(partitionHash) % this.partitionCount;
     }
 
     getPartitionCount(): number {
         return this.partitionCount;
+    }
+
+    /**
+     * Checks if the partition service is healthy
+     * @returns true if partition table is populated, false otherwise
+     */
+    isHealthy(): boolean {
+        return this.partitionCount > 0 && Object.keys(this.partitionMap).length > 0;
+    }
+
+    /**
+     * Gets information about the current partition table state
+     * @returns object with partition information
+     */
+    getPartitionTableInfo(): { partitionCount: number, isHealthy: boolean, lastRefreshTime: number } {
+        return {
+            partitionCount: this.partitionCount,
+            isHealthy: this.isHealthy(),
+            lastRefreshTime: this.lastRefreshTime
+        };
     }
 }

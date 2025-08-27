@@ -31,15 +31,41 @@ export class StaleReadDetectorImpl implements StaleReadDetector {
     }
 
     isStaleRead(key: any, record: DataRecord): boolean {
-        const metadata = this.getMetadataContainer(this.getPartitionId(record.key));
-        return !record.hasSameUuid(metadata.getUuid()) || record.getInvalidationSequence().lessThan(metadata.getStaleSequence());
+        try {
+            const metadata = this.getMetadataContainer(this.getPartitionId(record.key));
+            
+            // Add null checks to prevent errors during failover
+            if (!metadata || !metadata.getUuid()) {
+                // If metadata is not available, consider the read as potentially stale
+                // This can happen during failover when partition information is being updated
+                return true;
+            }
+            
+            return !record.hasSameUuid(metadata.getUuid()) || record.getInvalidationSequence().lessThan(metadata.getStaleSequence());
+        } catch (error) {
+            // During failover, partition service might not be fully initialized
+            // Consider the read as stale to be safe
+            return true;
+        }
     }
 
     getMetadataContainer(partitionId: number): MetadataContainer {
-        return this.repairingHandler.getMetadataContainer(partitionId);
+        try {
+            return this.repairingHandler.getMetadataContainer(partitionId);
+        } catch (error) {
+            // Return null if metadata container is not available
+            // This can happen during failover scenarios
+            return null;
+        }
     }
 
     getPartitionId(key: any): number {
-        return this.partitionService.getPartitionId(key);
+        try {
+            return this.partitionService.getPartitionId(key);
+        } catch (error) {
+            // Return -1 if partition service is not available
+            // This can happen during failover scenarios
+            return -1;
+        }
     }
 }

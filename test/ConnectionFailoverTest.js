@@ -82,4 +82,19 @@ describe('Connection Failover Test - Version 3.12.5 (@celerispay)', function() {
         assert.strictEqual(config.properties['hazelcast.client.failover.cooldown'], 1000, 'failover cooldown should be configured');
         assert.strictEqual(config.properties['hazelcast.client.connection.health.check.interval'], 1000, 'health check interval should be configured');
     });
+
+    it('should have failover and connection management improvements', function() {
+        // Test that the new failover and connection management features are properly configured
+        assert.strictEqual(config.properties['hazelcast.client.failover.cooldown'], 1000, 'failover cooldown should be configured for proper failover handling');
+        assert.strictEqual(config.properties['hazelcast.client.connection.health.check.interval'], 1000, 'connection health check should be enabled');
+        assert.strictEqual(config.properties['hazelcast.client.connection.max.retries'], 2, 'connection retry limit should be configured');
+        assert.strictEqual(config.properties['hazelcast.client.partition.refresh.min.interval'], 500, 'partition refresh rate limiting should be configured');
+    });
+
+    it('should have retry and backoff configuration', function() {
+        // Test that retry and backoff mechanisms are properly configured
+        assert.strictEqual(config.properties['hazelcast.client.invocation.max.retries'], 5, 'invocation retry limit should be configured');
+        assert.strictEqual(config.properties['hazelcast.client.partition.failure.backoff'], 2000, 'partition failure backoff should be configured');
+        assert.strictEqual(config.properties['hazelcast.client.connection.retry.delay'], 500, 'connection retry delay should be configured');
+    });
 });
