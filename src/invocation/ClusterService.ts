@@ -124,6 +124,13 @@ export class ClusterService {
     }
 
     /**
+     * Returns the owner connection if available
+     */
+    getOwnerConnection(): ClientConnection | null {
+        return this.ownerConnection;
+    }
+
+    /**
      * Returns the list of members in the cluster.
      * @returns
      */
@@ -165,16 +172,15 @@ export class ClusterService {
     getClientInfo(): ClientInfo {
         const info = new ClientInfo();
         info.uuid = this.uuid;
-        info.localAddress = this.getOwnerConnection().getLocalAddress();
+        
+        const ownerConnection = this.getOwnerConnection();
+        if (ownerConnection) {
+            info.localAddress = ownerConnection.getLocalAddress();
+        } else {
+            info.localAddress = null;
+        }
+        
         return info;
-    }
-
-    /**
-     * Returns the connection associated with owner node of this client.
-     * @returns {ClientConnection}
-     */
-    getOwnerConnection(): ClientConnection {
-        return this.ownerConnection;
     }
 
     /**
@@ -210,7 +216,13 @@ export class ClusterService {
             const handleAttributeChange = this.handleMemberAttributeChange.bind(this);
             ClientAddMembershipListenerCodec.handle(m, handleMember, handleMemberList, handleAttributeChange, null);
         };
-        return this.client.getInvocationService().invokeOnConnection(this.getOwnerConnection(), request, handler)
+        
+        const ownerConnection = this.getOwnerConnection();
+        if (!ownerConnection) {
+            return Promise.reject(new Error('Cannot initialize membership listener: no owner connection available'));
+        }
+        
+        return this.client.getInvocationService().invokeOnConnection(ownerConnection, request, handler)
             .then((resp: ClientMessage) => {
                 this.logger.trace('ClusterService', 'Registered listener with id '
                     + ClientAddMembershipListenerCodec.decodeResponse(resp).response);
@@ -680,7 +692,7 @@ export class ClusterService {
         // Check if we're already trying to connect to this address
         const connectionManager = this.client.getConnectionManager();
         const establishedConnections = connectionManager.getEstablishedConnections();
-        const pendingConnections = Object.keys(connectionManager.getPendingConnections || {}).length;
+        const pendingConnections = Object.keys(connectionManager.getPendingConnections()).length;
         
         if (pendingConnections > 0) {
             this.logger.debug('ClusterService', `Already have pending connections, skipping reconnection to ${addressStr}`);

@@ -96,6 +96,13 @@ export class ProxyManager {
             return this.proxies[fullName];
         }
 
+        // Check if cluster is healthy before creating proxy
+        if (!this.isClusterHealthy()) {
+            const error = new Error('Cluster is not healthy, cannot create proxy for ' + name);
+            this.logger.error('ProxyManager', error.message);
+            return Promise.reject(error);
+        }
+
         const deferred = DeferredPromise<DistributedObject>();
         let newProxy: DistributedObject;
         if (serviceName === ProxyManager.MAP_SERVICE && this.client.getConfig().getNearCacheConfig(name)) {
@@ -118,6 +125,9 @@ export class ProxyManager {
         if (createAtServer) {
             this.createProxy(newProxy).then(function (): void {
                 deferred.resolve(newProxy);
+            }).catch((error) => {
+                this.logger.error('ProxyManager', 'Failed to create proxy for ' + name + ': ' + error);
+                deferred.reject(error);
             });
         }
 
@@ -164,42 +174,70 @@ export class ProxyManager {
 
     private findNextAddress(): Address {
         const members = this.client.getClusterService().getMembers();
+        
+        // If no members available, return null but log the issue
+        if (!members || members.length === 0) {
+            this.logger.warn('ProxyManager', 'No cluster members available for proxy creation');
+            return null;
+        }
+        
         let liteMember: Member = null;
+        let dataMember: Member = null;
+        
         for (const member of members) {
             if (member != null && member.isLiteMember === false) {
-                return member.address;
+                dataMember = member;
+                break; // Prefer data members
             } else if (member != null && member.isLiteMember) {
                 liteMember = member;
             }
         }
 
-        if (liteMember != null) {
+        // Return data member if available, otherwise lite member, otherwise null
+        if (dataMember != null) {
+            return dataMember.address;
+        } else if (liteMember != null) {
             return liteMember.address;
         } else {
+            this.logger.warn('ProxyManager', 'No valid members found for proxy creation');
             return null;
         }
     }
 
     private initializeProxy(proxyObject: DistributedObject, promise: Promise.Resolver<ClientMessage>, deadline: number): void {
-        if (Date.now() <= deadline) {
-            const address: Address = this.findNextAddress();
-            const request = ClientCreateProxyCodec.encodeRequest(proxyObject.getName(), proxyObject.getServiceName(), address);
-            const invocation = new Invocation(this.client, request);
-            invocation.address = address;
-            this.client.getInvocationService().invoke(invocation).then((response) => {
-                promise.resolve(response);
-            }).catch((error) => {
-                if (this.isRetryable(error)) {
-                    this.logger.warn('ProxyManager', 'Create proxy request for ' + proxyObject.getName() +
-                        ' failed. Retrying in ' + this.invocationRetryPauseMillis + 'ms. ' + error);
-                    setTimeout(this.initializeProxy.bind(this, proxyObject, promise, deadline), this.invocationRetryPauseMillis);
-                } else {
-                    this.logger.warn('ProxyManager', 'Create proxy request for ' + proxyObject.getName() + ' failed ' + error);
-                }
-            });
-        } else {
-            promise.reject('Create proxy request timed-out for ' + proxyObject.getName());
+        if (Date.now() > deadline) {
+            const error = new Error('Create proxy request timed-out for ' + proxyObject.getName());
+            this.logger.error('ProxyManager', error.message);
+            promise.reject(error);
+            return;
         }
+        
+        const address: Address = this.findNextAddress();
+        if (!address) {
+            const error = new Error('No cluster members available for proxy creation: ' + proxyObject.getName());
+            this.logger.error('ProxyManager', error.message);
+            promise.reject(error);
+            return;
+        }
+        
+        const request = ClientCreateProxyCodec.encodeRequest(proxyObject.getName(), proxyObject.getServiceName(), address);
+        const invocation = new Invocation(this.client, request);
+        invocation.address = address;
+        
+        this.client.getInvocationService().invoke(invocation).then((response) => {
+            promise.resolve(response);
+        }).catch((error) => {
+            if (this.isRetryable(error)) {
+                this.logger.warn('ProxyManager', 'Create proxy request for ' + proxyObject.getName() +
+                    ' failed. Retrying in ' + this.invocationRetryPauseMillis + 'ms. ' + error);
+                setTimeout(() => {
+                    this.initializeProxy(proxyObject, promise, deadline);
+                }, this.invocationRetryPauseMillis);
+            } else {
+                this.logger.error('ProxyManager', 'Create proxy request for ' + proxyObject.getName() + ' failed ' + error);
+                promise.reject(error);
+            }
+        });
     }
 
     private createDistributedObjectListener(): ListenerMessageCodec {
@@ -214,5 +252,34 @@ export class ProxyManager {
                 return ClientRemoveDistributedObjectListenerCodec.encodeRequest(listenerId);
             },
         };
+    }
+
+    /**
+     * Checks if the cluster is healthy enough to create proxies
+     */
+    private isClusterHealthy(): boolean {
+        const members = this.client.getClusterService().getMembers();
+        const hasMembers = members && members.length > 0;
+        
+        if (!hasMembers) {
+            this.logger.warn('ProxyManager', 'No cluster members available');
+            return false;
+        }
+        
+        // Check if we have at least one data member
+        const hasDataMember = members.some(member => member && !member.isLiteMember);
+        if (!hasDataMember) {
+            this.logger.warn('ProxyManager', 'No data members available in cluster');
+            return false;
+        }
+        
+        // Check if we have an owner connection
+        const ownerConnection = this.client.getClusterService().getOwnerConnection();
+        if (!ownerConnection || !ownerConnection.isHealthy()) {
+            this.logger.warn('ProxyManager', 'No healthy owner connection available');
+            return false;
+        }
+        
+        return true;
     }
 }
