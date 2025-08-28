@@ -87,13 +87,15 @@ export class PartitionService {
         const ownerConnection = this.client.getClusterService().getOwnerConnection();
         if (ownerConnection == null) {
             this.logger.warn('PartitionService', 'Cannot refresh partitions, no owner connection available');
-            return Promise.resolve();
+            // Return a rejected promise instead of resolved to indicate failure
+            return Promise.reject(new Error('No owner connection available for partition refresh'));
         }
 
         this.refreshInProgress = true;
         const clientMessage: ClientMessage = GetPartitionsCodec.encodeRequest();
 
-        return this.client.getInvocationService()
+        // Add timeout to prevent hanging
+        const refreshPromise = this.client.getInvocationService()
             .invokeOnConnection(ownerConnection, clientMessage)
             .then((response: ClientMessage) => {
                 const receivedPartitionMap = GetPartitionsCodec.decodeResponse(response);
@@ -114,9 +116,19 @@ export class PartitionService {
                         this.clearPartitionTable();
                     }
                 }
+                throw e; // Re-throw the error to propagate it
             }).finally(() => {
                 this.refreshInProgress = false;
             });
+
+        // Add timeout to prevent hanging
+        const timeoutPromise = new Promise<void>((_, reject) => {
+            setTimeout(() => {
+                reject(new Error('Partition refresh timed out'));
+            }, 10000); // 10 second timeout
+        });
+
+        return Promise.race([refreshPromise, timeoutPromise]);
     }
 
     /**

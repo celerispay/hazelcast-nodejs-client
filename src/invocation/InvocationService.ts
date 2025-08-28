@@ -369,6 +369,10 @@ export class InvocationService {
                     throw new Error(`Still no partition owner for partition ${partitionId} after refresh`);
                 }
                 return this.invokeOnAddress(invocation, newOwnerAddress);
+            }).catch((error) => {
+                this.logger.error('InvocationService', `Failed to refresh partition table for partition ${partitionId}:`, error);
+                // If partition refresh fails, reject the invocation instead of hanging
+                throw new Error(`Cannot find partition owner for partition ${partitionId}: ${error.message}`);
             });
         }
 
@@ -383,6 +387,10 @@ export class InvocationService {
                 return this.client.getPartitionService().refresh().then(() => {
                     // Retry the invocation with updated partition information
                     return this.doInvoke(invocation);
+                }).catch((refreshError) => {
+                    this.logger.error('InvocationService', `Failed to refresh partition table after partition owner failure:`, refreshError);
+                    // If refresh fails, reject the invocation instead of hanging
+                    throw new Error(`Partition owner ${ownerAddress.toString()} unavailable and partition refresh failed: ${refreshError.message}`);
                 });
             }
             

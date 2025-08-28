@@ -118,9 +118,6 @@ export class ProxyManager {
         if (createAtServer) {
             this.createProxy(newProxy).then(function (): void {
                 deferred.resolve(newProxy);
-            }).catch((error) => {
-                this.logger.error('ProxyManager', 'Failed to create proxy for ' + name + ': ' + error);
-                deferred.reject(error);
             });
         }
 
