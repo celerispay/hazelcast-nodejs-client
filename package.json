@@ -1,6 +1,6 @@
 {
   "name": "@celerispay/hazelcast-client",
-  "version": "3.12.6",
+  "version": "3.12.7",
   "description": "Hazelcast - open source In-Memory Data Grid - client for NodeJS with critical connection failover fixes",
   "main": "./lib/index.js",
   "scripts": {
