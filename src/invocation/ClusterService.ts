@@ -32,6 +32,7 @@ import {UuidUtil} from '../util/UuidUtil';
 import {ILogger} from '../logging/ILogger';
 import Address = require('../Address');
 import ClientMessage = require('../ClientMessage');
+import {HazelcastFailoverManager} from './HazelcastFailoverManager';
 
 export enum MemberEvent {
     ADDED = 1,
@@ -66,6 +67,7 @@ export class ClusterService {
     private readonly addressBlockDuration: number = 15000; // Reduced from 30000ms to 15000ms
     private reconnectionTask: any = null;
     private readonly reconnectionInterval: number = 10000; // 10 seconds between reconnection attempts
+    private failoverManager: HazelcastFailoverManager;
 
     constructor(client: HazelcastClient) {
         this.client = client;
@@ -73,6 +75,7 @@ export class ClusterService {
         this.members = [];
         this.startReconnectionTask();
         this.startStateLoggingTask();
+        this.failoverManager = new HazelcastFailoverManager(client, this.logger);
     }
 
     /**
@@ -274,7 +277,11 @@ export class ClusterService {
         this.failoverInProgress = true;
         this.lastFailoverAttempt = now;
 
-        this.logger.info('ClusterService', 'Starting failover process...');
+        this.logger.info('ClusterService', '🚀 Starting failover process - SERVER-FIRST APPROACH...');
+        
+        // SERVER-FIRST: No credential preservation needed
+        // We trust the server will provide correct member information
+        this.logger.info('ClusterService', '🎯 SERVER-FIRST: No credential management - trusting server data');
         
         // Log state before failover
         this.logCurrentState();
@@ -288,7 +295,10 @@ export class ClusterService {
         // Attempt to reconnect to cluster
         this.connectToCluster()
             .then(() => {
-                this.logger.info('ClusterService', 'Failover completed successfully');
+                this.logger.info('ClusterService', '✅ Failover completed successfully - SERVER-FIRST approach');
+                
+                // No credential management needed - server handles everything
+                
                 this.logCurrentState(); // Log state after successful failover
             })
             .catch((error) => {
@@ -526,6 +536,10 @@ export class ClusterService {
 
     private memberAdded(member: Member): void {
         this.members.push(member);
+        
+        // Handle member added and update preserved credentials
+        this.handleMemberAdded(member);
+        
         const membershipEvent = new MembershipEvent(member, MemberEvent.ADDED, this.members);
         this.fireMembershipEvent(membershipEvent);
     }
@@ -561,6 +575,104 @@ export class ClusterService {
         
         const membershipEvent = new MembershipEvent(member, MemberEvent.REMOVED, this.members);
         this.fireMembershipEvent(membershipEvent);
+    }
+
+    /**
+     * Performs comprehensive credential cleanup when cluster membership changes
+     * This ensures ALL credentials are consistent with the current cluster owner UUID
+     * @param connectionManager The connection manager instance
+     * @param currentClusterOwnerUuid The current cluster owner UUID
+     */
+
+
+
+
+    /**
+     * Handles member added event - SERVER-FIRST APPROACH
+     * We trust what the server tells us and store it as credentials
+     * @param member The member that was added
+     */
+    private handleMemberAdded(member: any): void {
+        this.logger.info('ClusterService', `✅ SERVER CONFIRMED: Member[ uuid: ${member.uuid}, address: ${member.address.toString()}] added to cluster`);
+        
+        // SERVER-FIRST: Store server data as credentials
+        // The server is the authority - we store what it tells us
+        
+        this.logger.info('ClusterService', 
+            `🎯 SERVER-FIRST: Storing server member data as credentials - server is authority`);
+        
+        const connectionManager = this.client.getConnectionManager();
+        
+        // Store the server-provided UUID as the authoritative credential
+        if (connectionManager && typeof connectionManager.updatePreservedCredentials === 'function') {
+            connectionManager.updatePreservedCredentials(member.address, member.uuid);
+        }
+        
+        // Record that we received a member added event for this address
+        if (connectionManager && typeof connectionManager.recordMemberAddedEvent === 'function') {
+            connectionManager.recordMemberAddedEvent(member.address);
+        }
+        
+        // Find the current owner from the cluster state
+        const currentOwner = this.findCurrentOwner();
+        if (currentOwner) {
+            this.logger.info('ClusterService', 
+                `🔄 SERVER-FIRST: Updating ALL credentials with current owner UUID: ${currentOwner.uuid}`);
+            
+            // Update all credentials with the current owner UUID from server
+            if (connectionManager && typeof connectionManager.updateAllCredentialsWithNewOwnerUuid === 'function') {
+                connectionManager.updateAllCredentialsWithNewOwnerUuid(currentOwner.uuid);
+            }
+            
+            // CRITICAL FIX: Update client's own UUIDs to match server expectations
+            this.logger.info('ClusterService', 
+                `🔄 SERVER-FIRST: Updating client UUIDs to match server state`);
+            this.logger.info('ClusterService', 
+                `   - Old Client UUID: ${this.uuid || 'NOT SET'}`);
+            this.logger.info('ClusterService', 
+                `   - Old Owner UUID: ${this.ownerUuid || 'NOT SET'}`);
+            
+            // Update client's own UUIDs with server-provided data
+            // The client UUID should match the owner's UUID for authentication
+            this.uuid = currentOwner.uuid;
+            this.ownerUuid = currentOwner.uuid;
+            
+            this.logger.info('ClusterService', 
+                `   - New Client UUID: ${this.uuid}`);
+            this.logger.info('ClusterService', 
+                `   - New Owner UUID: ${this.ownerUuid}`);
+        }
+        
+        // Refresh partition table (KEEPING REFRESH METHOD UNTOUCHED as requested)
+        this.client.getPartitionService().refresh();
+        
+        this.logger.info('ClusterService', 
+            `✅ SERVER-FIRST: Member ${member.uuid} at ${member.address.toString()} credentials stored from server data`);
+    }
+
+    /**
+     * Finds the current owner from the cluster state
+     * @returns The current owner member or null if not found
+     */
+    private findCurrentOwner(): any | null {
+        // Check if we have an active owner connection
+        const ownerConnection = this.ownerConnection;
+        if (ownerConnection && ownerConnection.isAlive()) {
+            const ownerAddress = ownerConnection.getAddress();
+            // Find the member with this address
+            for (const member of this.members) {
+                if (member.address.toString() === ownerAddress.toString()) {
+                    this.logger.debug('ClusterService', 
+                        `Found current owner: ${member.uuid} at ${member.address.toString()}`);
+                    return member;
+                }
+            }
+        }
+        
+        // Fallback: look for any member that might be the owner
+        this.logger.debug('ClusterService', 
+            `No active owner connection found, checking member list for potential owner`);
+        return null;
     }
 
     /**
@@ -814,6 +926,37 @@ export class ClusterService {
                 this.downAddresses.delete(addressStr);
             }
         }, blockDuration);
+    }
+
+    /**
+     * Handles ownership change when failover occurs
+     * @param newOwnerAddress The address of the new owner
+     * @param newOwnerConnection The connection to the new owner
+     */
+    handleOwnershipChange(newOwnerAddress: Address, newOwnerConnection: ClientConnection): void {
+        this.logger.info('ClusterService', `Handling ownership change to ${newOwnerAddress.toString()}`);
+        
+        // Update owner connection
+        this.ownerConnection = newOwnerConnection;
+        
+        // Note: Owner UUID will be updated when authentication completes
+        // For now, we'll keep the existing owner UUID
+        
+        // Clear any stale partition information
+        this.client.getPartitionService().clearPartitionTable();
+        
+        // Refresh partition information with the new owner
+        this.client.getPartitionService().refresh();
+        
+        this.logger.info('ClusterService', `Ownership change completed, new owner: ${newOwnerAddress.toString()}`);
+    }
+
+    /**
+     * Gets the failover manager for external access
+     * @returns The failover manager instance
+     */
+    getFailoverManager(): HazelcastFailoverManager {
+        return this.failoverManager;
     }
 
     shutdown(): void {

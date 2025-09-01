@@ -72,12 +72,26 @@ export class Heartbeat {
             if (estConnections[address]) {
                 const conn = estConnections[address];
                 const now = Date.now();
+                
+                // More resilient heartbeat timeout check - only mark as stopped if REALLY stale
                 if (now - conn.getLastReadTimeMillis() > this.heartbeatTimeout) {
                     if (conn.isHeartbeating()) {
-                        conn.setHeartbeating(false);
-                        this.onHeartbeatStopped(conn);
+                        this.logger.debug('HeartbeatService', 
+                            `Connection ${conn} appears to have stopped heartbeating, but will verify before marking as stopped`);
+                        
+                        // Add a grace period before marking as stopped
+                        setTimeout(() => {
+                            // Re-check if still not heartbeating
+                            if (conn.isHeartbeating() && (Date.now() - conn.getLastReadTimeMillis() > this.heartbeatTimeout)) {
+                                conn.setHeartbeating(false);
+                                this.onHeartbeatStopped(conn);
+                                this.logger.warn('HeartbeatService', 
+                                    `Connection ${conn} confirmed to have stopped heartbeating after grace period`);
+                            }
+                        }, 5000); // 5 second grace period
                     }
                 }
+                
                 if (now - conn.getLastWriteTimeMillis() > this.heartbeatInterval) {
                     const req = ClientPingCodec.encodeRequest();
                     this.client.getInvocationService().invokeOnConnection(conn, req)

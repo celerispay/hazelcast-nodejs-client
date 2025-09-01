@@ -252,22 +252,32 @@ export class ClientConnection {
             this.logger.debug('ClientConnection', `Socket closed for ${this.address.toString()}`);
         });
 
-        // Handle socket end events
+        // Handle socket end events - be more resilient to temporary disconnections
         this.socket.on('end', () => {
-            this.closedTime = Date.now();
             this.logger.debug('ClientConnection', `Socket ended by remote for ${this.address.toString()}`);
+            
+            // Don't immediately mark as closed - this could be a temporary network hiccup
+            // Only mark as closed if we're certain it's a real disconnection
+            // The health check will handle this more gracefully
         });
 
-        // Handle socket errors
-        this.socket.on('error', (error: Error) => {
+        // Handle socket errors - be more resilient
+        this.socket.on('error', (error: any) => {
             this.logger.warn('ClientConnection', `Socket error for ${this.address.toString()}:`, error);
-            // Don't set closedTime here as the socket might still be usable
+            
+            // Only mark as closed for specific error types that indicate real disconnection
+            if (error.code === 'ECONNRESET' || error.code === 'EPIPE') {
+                this.logger.warn('ClientConnection', `Critical socket error for ${this.address.toString()}, marking as closed`);
+                this.closedTime = Date.now();
+            }
+            // For other errors, don't immediately close - let health check handle it
         });
 
-        // Handle socket timeout
+        // Handle socket timeout - be more resilient
         this.socket.on('timeout', () => {
             this.logger.warn('ClientConnection', `Socket timeout for ${this.address.toString()}`);
             // Don't set closedTime here as the socket might still be usable
+            // Let the health check handle this more gracefully
         });
     }
 
@@ -310,8 +320,44 @@ export class ClientConnection {
      * Closes this connection.
      */
     close(): void {
+        const addressStr = this.address.toString();
+        
+        // Log who is initiating the disconnection
+        this.logger.info('ClientConnection', 
+            `🔌 CLIENT INITIATED DISCONNECTION from ${addressStr}`);
+        
+        // Log the call stack to understand why this is being called
+        this.logger.info('ClientConnection', 
+            `🔍 Close Connection Call Stack for ${addressStr}:`);
+        const stack = new Error().stack;
+        if (stack) {
+            this.logger.info('ClientConnection', 
+                `   - Called from: ${stack.split('\n').slice(1, 4).join(' | ')}`);
+        }
+        
+        // Log connection state at closure
+        this.logger.info('ClientConnection', 
+            `📊 Connection State at Closure for ${addressStr}:`);
+        this.logger.info('ClientConnection', 
+            `   - Is Alive: ${this.isAlive()}`);
+        this.logger.info('ClientConnection', 
+            `   - Is Healthy: ${this.isHealthy()}`);
+        this.logger.info('ClientConnection', 
+            `   - Is Heartbeating: ${this.isHeartbeating()}`);
+        this.logger.info('ClientConnection', 
+            `   - Is Owner: ${this.isAuthenticatedAsOwner()}`);
+        this.logger.info('ClientConnection', 
+            `   - Last Read: ${this.lastReadTimeMillis > 0 ? Math.round((Date.now() - this.lastReadTimeMillis) / 1000) + 's ago' : 'never'}`);
+        this.logger.info('ClientConnection', 
+            `   - Last Write: ${this.lastWriteTimeMillis > 0 ? Math.round((Date.now() - this.lastWriteTimeMillis) / 1000) + 's ago' : 'never'}`);
+        this.logger.info('ClientConnection', 
+            `   - Connection Age: ${Math.round((Date.now() - this.startTime) / 1000)}s`);
+        
         this.socket.end();
         this.closedTime = Date.now();
+        
+        this.logger.info('ClientConnection', 
+            `✅ Disconnection completed for ${addressStr}`);
     }
 
     /**
@@ -334,11 +380,13 @@ export class ClientConnection {
             return false;
         }
         
-        // Check if we've received data recently (within last 30 seconds)
+        // More resilient data freshness check - only fail if REALLY stale
         const now = Date.now();
-        const lastReadThreshold = 30000; // 30 seconds
+        const lastReadThreshold = 120000; // Increased from 30s to 2 minutes for production resilience
+        
         if (this.lastReadTimeMillis > 0 && (now - this.lastReadTimeMillis) > lastReadThreshold) {
-            // If we haven't received data for a while, the connection might be stale
+            // Only mark as dead if we haven't received data for 2 minutes
+            // This prevents false drops due to temporary network hiccups
             return false;
         }
         
@@ -350,13 +398,17 @@ export class ClientConnection {
      * @returns true if connection is healthy, false otherwise
      */
     isHealthy(): boolean {
+        const addressStr = this.address.toString();
+        
         if (!this.isAlive()) {
             return false;
         }
         
-        // Additional health checks can be added here
-        // For now, just check if we're still heartbeating
-        return this.isHeartbeating();
+        if (!this.isHeartbeating()) {
+            return false;
+        }
+        
+        return true;
     }
 
     isHeartbeating(): boolean {

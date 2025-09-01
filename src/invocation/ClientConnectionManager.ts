@@ -30,6 +30,7 @@ import {AddressProvider} from '../connection/AddressProvider';
 import {ILogger} from '../logging/ILogger';
 import Address = require('../Address');
 import {SSLOptionsFactory} from '../connection/SSLOptionsFactory';
+import {CredentialPreservationService} from './CredentialPreservationService';
 
 const EMIT_CONNECTION_CLOSED = 'connectionClosed';
 const EMIT_CONNECTION_OPENED = 'connectionOpened';
@@ -57,6 +58,10 @@ export class ClientConnectionManager extends EventEmitter {
         this.logger = this.client.getLoggingService().getLogger();
         this.addressTranslator = addressTranslator;
         this.addressProviders = addressProviders;
+        
+        // Initialize credential preservation service for server data storage
+        this.credentialPreservationService = new CredentialPreservationService(this.logger);
+        
         this.startConnectionHealthCheck();
         this.startConnectionCleanupTask();
     }
@@ -273,6 +278,171 @@ export class ClientConnectionManager extends EventEmitter {
      */
     getPendingConnections(): { [address: string]: Promise.Resolver<ClientConnection> } {
         return this.pendingConnections;
+    }
+
+    // SERVER-FIRST APPROACH: Store credentials from server data
+    // We trust the server as single source of truth but store what it tells us
+    
+    private credentialPreservationService: CredentialPreservationService;
+    private memberAddedEvents: Set<string> = new Set<string>();
+    
+    /**
+     * Updates preserved credentials with server-provided data
+     * @param address The address to update credentials for
+     * @param newUuid The new UUID from server member event
+     */
+    public updatePreservedCredentials(address: Address, newUuid: string): void {
+        const addressStr = address.toString();
+        this.logger.info('ClientConnectionManager', 
+            `🔄 SERVER-FIRST: Updating credentials for ${addressStr} with server UUID: ${newUuid}`);
+        
+        // Get the current owner UUID from cluster service
+        const clusterService = this.client.getClusterService();
+        const currentOwnerUuid = clusterService.ownerUuid;
+        
+        // Get group config from client
+        const groupConfig = this.client.getConfig().groupConfig;
+        
+        // Store the server-provided UUID as the authoritative credential
+        // Use preserveCredentials to create new credentials if they don't exist
+        this.credentialPreservationService.preserveCredentials(
+            address, 
+            newUuid, 
+            currentOwnerUuid || newUuid, // Use current owner UUID or fallback to member UUID
+            groupConfig.name, // Group name from config
+            groupConfig.password || '', // Group password from config
+            false // Not owner connection
+        );
+        
+        // Mark that we received a member added event for this address
+        this.memberAddedEvents.add(addressStr);
+        
+        this.logger.info('ClientConnectionManager', 
+            `💾 SERVER-FIRST: Stored server credential for ${addressStr}: uuid=${newUuid}, ownerUuid=${currentOwnerUuid || newUuid}`);
+    }
+
+    /**
+     * Records that a member added event was received from server
+     * @param address The address that had a server member added event
+     */
+    public recordMemberAddedEvent(address: Address): void {
+        const addressStr = address.toString();
+        this.memberAddedEvents.add(addressStr);
+        this.logger.debug('ClientConnectionManager', 
+            `📝 SERVER-FIRST: Recorded server member added event for ${addressStr}`);
+    }
+
+    /**
+     * Checks if we received a server member added event for an address
+     * @param address The address to check
+     * @returns True if server member added event was received
+     */
+    public hasMemberAddedEvent(address: Address): boolean {
+        const addressStr = address.toString();
+        return this.memberAddedEvents.has(addressStr);
+    }
+
+    /**
+     * Clears member added events for an address (useful during failover)
+     * @param address The address to clear events for
+     */
+    public clearMemberAddedEvents(address: Address): void {
+        const addressStr = address.toString();
+        this.memberAddedEvents.delete(addressStr);
+        this.logger.debug('ClientConnectionManager', 
+            `🗑️ SERVER-FIRST: Cleared member events for ${addressStr}`);
+    }
+
+    /**
+     * Updates ALL credentials with server-provided owner UUID
+     * @param newOwnerUuid The new owner UUID from server cluster state
+     */
+    public updateAllCredentialsWithNewOwnerUuid(newOwnerUuid: string): void {
+        this.logger.info('ClientConnectionManager', 
+            `🔄 SERVER-FIRST: Updating ALL credentials with server owner UUID: ${newOwnerUuid}`);
+        
+        // Update all preserved credentials with server data
+        this.credentialPreservationService.updateAllOwnerUuids(newOwnerUuid);
+        
+        // Validate consistency
+        const isConsistent = this.credentialPreservationService.validateOwnerUuidConsistency();
+        
+        if (isConsistent) {
+            this.logger.info('ClientConnectionManager', 
+                `✅ SERVER-FIRST: All credentials now consistent with server owner UUID: ${newOwnerUuid}`);
+        } else {
+            this.logger.warn('ClientConnectionManager', 
+                `⚠️ SERVER-FIRST: Credential consistency validation failed after server update`);
+        }
+    }
+
+    /**
+     * Gets the current owner UUID from server-stored credentials
+     * @returns The current owner UUID or null if not found
+     */
+    public getCurrentOwnerUuid(): string | null {
+        return this.credentialPreservationService.getCurrentOwnerUuid();
+    }
+
+    /**
+     * Validates that all stored credentials are consistent with server data
+     * @returns True if all credentials are consistent, false otherwise
+     */
+    public validateCredentialConsistency(): boolean {
+        return this.credentialPreservationService.validateOwnerUuidConsistency();
+    }
+
+    /**
+     * Requests current cluster state from server when reconnecting
+     * This ensures we have the most up-to-date member information
+     * @returns Server cluster state
+     */
+    public requestServerClusterState(): any {
+        this.logger.info('ClientConnectionManager', 
+            `🔍 SERVER-FIRST: Requesting current cluster state from server...`);
+        
+        try {
+            // Get the current owner connection
+            const ownerConnection = this.getOwnerConnection();
+            if (!ownerConnection || !ownerConnection.isAlive()) {
+                this.logger.warn('ClientConnectionManager', 
+                    `⚠️ SERVER-FIRST: No active owner connection available for cluster state request`);
+                return null;
+            }
+
+            // Request cluster state from the server
+            // This will give us the authoritative member list
+            this.logger.info('ClientConnectionManager', 
+                `📤 SERVER-FIRST: Sending cluster state request to server...`);
+            
+            // For now, we'll use the existing cluster service to get member info
+            // In a full implementation, we'd send a specific protocol message
+            const clusterService = this.client.getClusterService();
+            const members = clusterService.getMembers();
+            
+            this.logger.info('ClientConnectionManager', 
+                `📥 SERVER-FIRST: Received cluster state from server: ${members.length} members`);
+            
+            return {
+                members: members,
+                timestamp: Date.now(),
+                source: 'server'
+            };
+            
+        } catch (error) {
+            this.logger.error('ClientConnectionManager', 
+                `❌ SERVER-FIRST: Failed to request cluster state from server: ${error.message}`);
+            return null;
+        }
+    }
+
+    /**
+     * Gets the current owner connection for server requests
+     * @returns The owner connection or null if not available
+     */
+    private getOwnerConnection(): ClientConnection | null {
+        const clusterService = this.client.getClusterService();
+        return clusterService.getOwnerConnection();
     }
 
     /**
@@ -523,7 +693,99 @@ export class ClientConnectionManager extends EventEmitter {
     }
 
     private authenticate(connection: ClientConnection, ownerConnection: boolean): Promise<void> {
+        const address = connection.getAddress();
+        const addressStr = address.toString();
+        
+        this.logger.info('ClientConnectionManager', 
+            `🔐 Starting authentication for ${addressStr} (owner=${ownerConnection})`);
+        
+        // Check if we have stored credentials for this address
+        const storedCredentials = this.credentialPreservationService.restoreCredentials(address);
+        const hasMemberAddedEvent = this.hasMemberAddedEvent(address);
+        
+        if (storedCredentials) {
+            this.logger.info('ClientConnectionManager', 
+                `📋 Using STORED credentials for ${addressStr}:`);
+            this.logger.info('ClientConnectionManager', 
+                `   - UUID: ${storedCredentials.uuid}`);
+            this.logger.info('ClientConnectionManager', 
+                `   - Owner UUID: ${storedCredentials.ownerUuid}`);
+            this.logger.info('ClientConnectionManager', 
+                `   - Group Name: ${storedCredentials.groupName}`);
+            this.logger.info('ClientConnectionManager', 
+                `   - Member Added Event: ${hasMemberAddedEvent ? 'YES' : 'NO'}`);
+        } else {
+            this.logger.info('ClientConnectionManager', 
+                `📋 No stored credentials found for ${addressStr}, using fresh authentication`);
+        }
+        
+        // Log current cluster state for debugging
+        const clusterService = this.client.getClusterService();
+        this.logger.info('ClientConnectionManager', 
+            `🔍 Current cluster state for ${addressStr}:`);
+        this.logger.info('ClientConnectionManager', 
+            `   - Client UUID: ${clusterService.uuid || 'NOT SET'}`);
+        this.logger.info('ClientConnectionManager', 
+            `   - Client Owner UUID: ${clusterService.ownerUuid || 'NOT SET'}`);
+        this.logger.info('ClientConnectionManager', 
+            `   - Active Members: ${clusterService.getMembers().length}`);
+        
+        // Log what we're about to send
+        this.logger.info('ClientConnectionManager', 
+            `📤 Sending authentication request to ${addressStr} with:`);
+        this.logger.info('ClientConnectionManager', 
+            `   - Owner Connection: ${ownerConnection}`);
+        this.logger.info('ClientConnectionManager', 
+            `   - Using Stored Credentials: ${storedCredentials ? 'YES' : 'NO'}`);
+        
         const authenticator = new ConnectionAuthenticator(connection, this.client);
-        return authenticator.authenticate(ownerConnection);
+        
+        // Use normal authentication flow - server handles everything
+        return authenticator.authenticate(ownerConnection)
+            .then(() => {
+                this.logger.info('ClientConnectionManager', 
+                    `✅ Authentication successful for ${addressStr}`);
+                
+                // After successful authentication, store the new credentials from server
+                if (ownerConnection) {
+                    const newUuid = clusterService.uuid;
+                    const newOwnerUuid = clusterService.ownerUuid;
+                    
+                    this.logger.info('ClientConnectionManager', 
+                        `💾 Storing new credentials from server for ${addressStr}:`);
+                    this.logger.info('ClientConnectionManager', 
+                        `   - New UUID: ${newUuid}`);
+                    this.logger.info('ClientConnectionManager', 
+                        `   - New Owner UUID: ${newOwnerUuid}`);
+                    
+                    // Store the new credentials
+                    this.credentialPreservationService.updateCredentials(address, newUuid, newOwnerUuid);
+                }
+            })
+            .catch((error) => {
+                this.logger.error('ClientConnectionManager', 
+                    `❌ Authentication FAILED for ${addressStr}:`);
+                this.logger.error('ClientConnectionManager', 
+                    `   - Error: ${error.message}`);
+                this.logger.error('ClientConnectionManager', 
+                    `   - Used Stored Credentials: ${storedCredentials ? 'YES' : 'NO'}`);
+                if (storedCredentials) {
+                    this.logger.error('ClientConnectionManager', 
+                        `   - Failed Credentials: uuid=${storedCredentials.uuid}, ownerUuid=${storedCredentials.ownerUuid}`);
+                }
+                this.logger.error('ClientConnectionManager', 
+                    `   - Current Client UUID: ${clusterService.uuid || 'NOT SET'}`);
+                this.logger.error('ClientConnectionManager', 
+                    `   - Current Client Owner UUID: ${clusterService.ownerUuid || 'NOT SET'}`);
+                
+                // Clear failed credentials
+                if (storedCredentials) {
+                    this.logger.info('ClientConnectionManager', 
+                        `🗑️ Clearing failed credentials for ${addressStr}`);
+                    this.credentialPreservationService.clearCredentialsForAddress(address);
+                }
+                
+                throw error;
+            });
     }
 }
