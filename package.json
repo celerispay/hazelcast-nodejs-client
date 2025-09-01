@@ -38,18 +38,19 @@
   },
   "homepage": "https://github.com/celerispay/hazelcast-nodejs-client#readme",
   "dependencies": {
-    "bluebird": "3.5.1",
-    "long": "3.2.0",
-    "winston": "2.3.1"
+    "bluebird": "^3.7.2",
+    "long": "^4.0.0",
+    "safe-buffer": "^5.2.1"
   },
   "devDependencies": {
+    "@types/bluebird": "^3.5.21",
+    "@types/long": "^3.0.32",
     "@types/node": "8.0.0",
     "mocha": "3.2.0",
     "sinon": "4.0.0",
     "tslint": "5.7.0",
     "typedoc": "^0.16.11",
-    "typescript": "2.8.4",
-    "winston": "2.3.1"
+    "typescript": "2.8.4"
   },
   "typings": "./lib/index"
 }
