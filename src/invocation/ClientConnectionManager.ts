@@ -611,9 +611,21 @@ export class ClientConnectionManager extends EventEmitter {
 
     private triggerConnect(address: Address, asOwner: boolean): Promise<net.Socket> {
         if (!asOwner) {
-            if (this.client.getClusterService().getOwnerConnection() == null) {
-                const error = new IllegalStateError('Owner connection is not available!');
-                return Promise.reject(error);
+            const ownerConnection = this.client.getClusterService().getOwnerConnection();
+            if (ownerConnection == null) {
+                // Check if this is a single-node scenario
+                const knownAddresses = this.client.getClusterService().getKnownAddresses();
+                const isSingleNode = knownAddresses.length === 1;
+                
+                if (isSingleNode) {
+                    // Allow connection in single-node scenario
+                    this.logger.info('ClientConnectionManager', 
+                        `🔗 SINGLE-NODE: Allowing connection to ${address.toString()} (only node in cluster)`);
+                } else {
+                    // Multi-node scenario - require owner connection (preserve existing logic)
+                    const error = new IllegalStateError('Owner connection is not available!');
+                    return Promise.reject(error);
+                }
             }
         }
 

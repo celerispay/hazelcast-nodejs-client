@@ -134,6 +134,20 @@ export class ClusterService {
     }
 
     /**
+     * Returns whether failover is currently in progress
+     */
+    isFailoverInProgress(): boolean {
+        return this.failoverInProgress;
+    }
+
+    /**
+     * Returns the list of known addresses in the cluster
+     */
+    getKnownAddresses(): Address[] {
+        return [...this.knownAddresses]; // Return a copy to prevent external modification
+    }
+
+    /**
      * Returns the list of members in the cluster.
      * @returns
      */
@@ -412,7 +426,7 @@ export class ClusterService {
         
         if (this.knownAddresses.length <= index) {
             remainingAttemptLimit = remainingAttemptLimit - 1;
-            if (remainingAttemptLimit === 0) {
+            if (remainingAttemptLimit <= 0) {
                 const errorMessage = 'Unable to connect to any of the following addresses: ' +
                     this.knownAddresses.map((element: Address) => {
                         return element.toString();
