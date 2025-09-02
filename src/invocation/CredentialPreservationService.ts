@@ -141,6 +141,17 @@ export class CredentialPreservationService {
     }
 
     /**
+     * Clears all stored credentials - used for cluster reset scenarios
+     */
+    clearAllCredentials(): void {
+        const credentialCount = this.nodeCredentials.size;
+        this.nodeCredentials.clear();
+        
+        this.logger.info('CredentialPreservationService', 
+            `🧹 Cleared all ${credentialCount} stored credentials for cluster reset`);
+    }
+
+    /**
      * Cleans up stale credentials older than the specified age
      * @param maxAgeMs Maximum age in milliseconds (default: 5 minutes)
      */

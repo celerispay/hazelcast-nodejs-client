@@ -291,12 +291,64 @@ export class ClusterService {
         this.failoverInProgress = true;
         this.lastFailoverAttempt = now;
 
-        this.logger.info('ClusterService', '🚀 Starting failover process - SERVER-FIRST APPROACH...');
+        // Check if this is a single-node scenario
+        const isSingleNode = this.knownAddresses.length === 1;
         
-        // SERVER-FIRST: No credential preservation needed
-        // We trust the server will provide correct member information
-        this.logger.info('ClusterService', '🎯 SERVER-FIRST: No credential management - trusting server data');
+        if (isSingleNode) {
+            this.logger.info('ClusterService', '🔄 SINGLE-NODE CLUSTER RESET: Node restart detected, starting fresh...');
+            this.handleSingleNodeClusterReset();
+        } else {
+            this.logger.info('ClusterService', '🚀 Starting failover process - SERVER-FIRST APPROACH...');
+            
+            // SERVER-FIRST: No credential preservation needed
+            // We trust the server will provide correct member information
+            this.logger.info('ClusterService', '🎯 SERVER-FIRST: No credential management - trusting server data');
+            this.handleMultiNodeFailover();
+        }
+    }
+
+    /**
+     * Handles single-node cluster reset - treats node restart as fresh cluster
+     */
+    private handleSingleNodeClusterReset(): void {
+        this.logger.info('ClusterService', '🧹 SINGLE-NODE RESET: Clearing all credentials and state...');
         
+        // Clear all stored credentials - node restart means fresh cluster
+        this.client.getConnectionManager().clearAllCredentials();
+        
+        // Reset client UUIDs - will be assigned fresh by server
+        this.uuid = null;
+        this.ownerUuid = null;
+        
+        // Log state before reset
+        this.logCurrentState();
+        
+        // Force cleanup of all dead connections
+        this.client.getConnectionManager().forceCleanupDeadConnections();
+        
+        // Clear partition information
+        this.client.getPartitionService().clearPartitionTable();
+        
+        // Direct reconnection without waiting for member events
+        this.logger.info('ClusterService', '🔄 SINGLE-NODE RESET: Attempting direct reconnection...');
+        this.connectToCluster()
+            .then(() => {
+                this.logger.info('ClusterService', '✅ Single-node cluster reset completed successfully');
+                this.logCurrentState();
+            })
+            .catch((error) => {
+                this.logger.error('ClusterService', 'Single-node cluster reset failed', error);
+                this.logCurrentState();
+            })
+            .finally(() => {
+                this.failoverInProgress = false;
+            });
+    }
+
+    /**
+     * Handles multi-node failover - preserves existing logic
+     */
+    private handleMultiNodeFailover(): void {
         // Log state before failover
         this.logCurrentState();
         

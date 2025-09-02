@@ -566,6 +566,21 @@ export class ClientConnectionManager extends EventEmitter {
     }
 
     /**
+     * Clears all stored credentials - used for single-node cluster reset
+     */
+    clearAllCredentials(): void {
+        this.logger.info('ClientConnectionManager', '🧹 Clearing all stored credentials for cluster reset');
+        
+        // Clear all stored credentials
+        this.credentialPreservationService.clearAllCredentials();
+        
+        // Clear all failed connections to allow fresh reconnection attempts
+        this.failedConnections.clear();
+        
+        this.logger.info('ClientConnectionManager', '✅ All credentials cleared, ready for fresh authentication');
+    }
+
+    /**
      * Handles authentication errors by clearing failed connections and allowing retry
      * @param address The address that had authentication issues
      */
