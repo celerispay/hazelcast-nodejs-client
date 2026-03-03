@@ -15,6 +15,7 @@
  */
 
 import {ClientConnection} from './ClientConnection';
+import * as net from 'net';
 import * as Promise from 'bluebird';
 import {ClientAddMembershipListenerCodec} from '../codec/ClientAddMembershipListenerCodec';
 import {Member} from '../core/Member';
@@ -308,54 +309,92 @@ export class ClusterService {
     }
 
     /**
-     * Handles single-node cluster reset - treats node restart as fresh cluster
+     * Handles single-node node loss. Tears down all state immediately and starts
+     * a TCP probe loop. Only once the port accepts a raw TCP connection do we
+     * attempt the full Hazelcast handshake — eliminating the race between
+     * destroyConnection() re-adding failedConnections and our attempts to clear them.
      */
     private handleSingleNodeClusterReset(): void {
-        this.logger.info('ClusterService', '🧹 SINGLE-NODE RESET: Clearing all credentials and state...');
-        
-        // Clear all stored credentials - node restart means fresh cluster
-        this.client.getConnectionManager().clearAllCredentials();
-        
-        // Reset client UUIDs - will be assigned fresh by server
+        this.logger.info('ClusterService', 'SINGLE-NODE: Node lost. Tearing down state and starting TCP probe loop.');
+
+        // Full state teardown
         this.uuid = null;
         this.ownerUuid = null;
-        
-        // Log state before reset
-        this.logCurrentState();
-        
-        // Force cleanup of all dead connections
+        this.members = [];
+        this.client.getConnectionManager().clearAllCredentials();
+        this.client.getConnectionManager().clearFailedConnections();
         this.client.getConnectionManager().forceCleanupDeadConnections();
-        
-        // Clear partition information
         this.client.getPartitionService().clearPartitionTable();
-        
-        // IMPORTANT: Unblock all down addresses before attempting reconnection.
-        // We must clear BOTH blocklists:
-        //   1. this.downAddresses  — ClusterService-level block (checked by tryConnectingToAddresses)
-        //   2. failedConnections   — ClientConnectionManager-level block (checked by getOrConnect)
-        // We delay by 200ms to let any in-flight async destroyConnection() calls finish,
-        // because destroyConnection() re-adds the address to failedConnections after we clear it.
-        // Clearing both right before connectToCluster() ensures neither blocklist interferes.
-        this.logger.info('ClusterService', '🔓 SINGLE-NODE RESET: Scheduling reconnection after brief stabilization delay...');
-        setTimeout(() => {
-            // Clear both blocklists right before attempting reconnection
-            this.downAddresses.clear();
-            this.client.getConnectionManager().clearFailedConnections();
-            
-            this.logger.info('ClusterService', '🔄 SINGLE-NODE RESET: Attempting direct reconnection...');
-            this.connectToCluster()
-                .then(() => {
-                    this.logger.info('ClusterService', '✅ Single-node cluster reset completed successfully');
-                    this.logCurrentState();
-                })
-                .catch((error) => {
-                    this.logger.error('ClusterService', 'Single-node cluster reset failed', error);
-                    this.logCurrentState();
-                })
-                .finally(() => {
-                    this.failoverInProgress = false;
-                });
-        }, 200);
+        this.downAddresses.clear();
+
+        // Start probing — reconnect only when the port actually accepts TCP
+        const address = this.knownAddresses[0];
+        this.startSingleNodeProbeLoop(address);
+    }
+
+    /**
+     * Probes the single-node address with a raw TCP socket every probeIntervalMs.
+     * When the port responds (connect event), destroys the probe socket and
+     * calls connectToCluster() to perform the full Hazelcast authentication.
+     * If connectToCluster() fails (server still warming up), retries the probe.
+     * Stops if the client is shut down.
+     */
+    private startSingleNodeProbeLoop(address: Address): void {
+        const probeIntervalMs = 3000;
+        const host = address.host;
+        const port = address.port;
+
+        this.logger.info('ClusterService',
+            `SINGLE-NODE PROBE: Waiting for ${host}:${port} to accept connections (probing every ${probeIntervalMs}ms)...`);
+
+        const attempt = () => {
+            if (!this.client.getLifecycleService().isRunning()) {
+                this.logger.info('ClusterService', 'SINGLE-NODE PROBE: Client is shutting down, stopping probe loop.');
+                this.failoverInProgress = false;
+                return;
+            }
+
+            const socket = net.createConnection({ host, port });
+
+            socket.once('connect', () => {
+                socket.destroy();
+                this.logger.info('ClusterService',
+                    `SINGLE-NODE PROBE: ${host}:${port} is accepting connections. Reinitialising Hazelcast connection...`);
+
+                // Clear both blocklists right before connecting — destroyConnection()
+                // may have re-added the address to failedConnections since the teardown above.
+                this.downAddresses.clear();
+                this.client.getConnectionManager().clearFailedConnections();
+
+                this.connectToCluster()
+                    .then(() => {
+                        this.logger.info('ClusterService', 'SINGLE-NODE: Reconnected successfully.');
+                        this.logCurrentState();
+                        this.failoverInProgress = false;
+                    })
+                    .catch((err: any) => {
+                        this.logger.warn('ClusterService',
+                            `SINGLE-NODE: connectToCluster failed after probe success (${err.message}). Retrying probe...`);
+                        // Server accepted TCP but Hazelcast not fully ready yet — probe again
+                        this.downAddresses.clear();
+                        this.client.getConnectionManager().clearFailedConnections();
+                        setTimeout(attempt, probeIntervalMs);
+                    });
+            });
+
+            socket.once('error', () => {
+                socket.destroy();
+                setTimeout(attempt, probeIntervalMs);
+            });
+
+            // Guard against hung sockets that produce neither connect nor error
+            socket.setTimeout(2000, () => {
+                socket.destroy();
+                setTimeout(attempt, probeIntervalMs);
+            });
+        };
+
+        attempt();
     }
 
     /**
