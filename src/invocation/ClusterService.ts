@@ -329,6 +329,14 @@ export class ClusterService {
         // Clear partition information
         this.client.getPartitionService().clearPartitionTable();
         
+        // IMPORTANT: Unblock all down addresses before attempting reconnection.
+        // The address was just marked as down by onConnectionClosed/onHeartbeatStopped,
+        // but connectToCluster() skips blocked addresses — so without clearing the block
+        // it will immediately fail with "Unable to connect to any address".
+        // clearAllCredentials() already clears failedConnections inside ConnectionManager.
+        this.logger.info('ClusterService', '🔓 SINGLE-NODE RESET: Unblocking all addresses for fresh reconnection...');
+        this.downAddresses.clear();
+        
         // Direct reconnection without waiting for member events
         this.logger.info('ClusterService', '🔄 SINGLE-NODE RESET: Attempting direct reconnection...');
         this.connectToCluster()
@@ -944,25 +952,42 @@ export class ClusterService {
         
         // Remove from down addresses to allow connection attempt
         this.downAddresses.delete(addressStr);
-        this.logger.debug('ClusterService', `Attempting reconnection to ${addressStr}`);
         
-        // Attempt to establish connection (not as owner, just as regular member connection)
-        this.client.getConnectionManager().getOrConnect(address, false)
+        // Determine whether to connect as owner.
+        // If we have no owner connection (e.g. after a single-node restart), we must
+        // authenticate as owner so the server assigns fresh UUIDs. Connecting as a
+        // non-owner with null UUIDs will always be rejected by the server.
+        const needsOwner = !this.ownerConnection || !this.ownerConnection.isHealthy();
+        const connectAsOwner = needsOwner;
+        
+        this.logger.info('ClusterService', 
+            `Attempting reconnection to ${addressStr} (asOwner=${connectAsOwner}, needsOwner=${needsOwner})`);
+        
+        this.client.getConnectionManager().getOrConnect(address, connectAsOwner)
             .then((connection: ClientConnection) => {
                 this.logger.info('ClusterService', `Successfully reconnected to ${addressStr}`);
                 
-                // Only evaluate ownership change if we don't have an owner or current owner is unhealthy
-                if (!this.ownerConnection || !this.ownerConnection.isHealthy()) {
-                    this.logger.info('ClusterService', `Evaluating ownership change for ${addressStr}`);
-                    this.evaluateOwnershipChange(address, connection);
+                if (connectAsOwner) {
+                    // We authenticated as owner — make it official and re-register membership listener
+                    connection.setAuthenticatedAsOwner(true);
+                    this.ownerConnection = connection;
+                    this.logger.info('ClusterService', `Promoted ${addressStr} to owner after reconnection`);
+                    
+                    // Re-register membership listener so member events resume
+                    return this.initMembershipListener().then(() => {
+                        this.logger.info('ClusterService', `Membership listener re-registered after reconnection to ${addressStr}`);
+                        this.client.getPartitionService().refresh();
+                    }).catch((err: any) => {
+                        this.logger.warn('ClusterService', `Failed to re-register membership listener after reconnection: ${err.message}`);
+                        this.client.getPartitionService().refresh();
+                    });
                 } else {
+                    // Non-owner: evaluate if ownership should change (multi-node case)
                     this.logger.debug('ClusterService', `Keeping ${addressStr} as member connection, current owner is healthy`);
+                    this.client.getPartitionService().refresh();
                 }
                 
-                // Trigger partition service refresh to update routing information
-                this.client.getPartitionService().refresh();
-                
-            }).catch((error) => {
+            }).catch((error: any) => {
                 this.logger.warn('ClusterService', `Reconnection attempt to ${addressStr} failed:`, error);
                 
                 // Mark the address as down again, but with a shorter block duration for reconnection attempts
