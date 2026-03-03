@@ -542,10 +542,53 @@ export class ClusterService {
         // Log current state after member list update
         this.logCurrentState();
         
+        // In smart routing mode, proactively open connections to all non-owner members
+        // so that partition-aware routing can work across all nodes.
+        if (this.client.getConfig().networkConfig.smartRouting) {
+            this.connectToNonOwnerMembers(members);
+        }
+        
         const events = this.detectMembershipEvents(prevMembers);
         for (const event of events) {
             this.fireMembershipEvent(event);
         }
+    }
+
+    /**
+     * Proactively opens connections to all non-owner cluster members.
+     * Required for smart routing: the client needs a live connection to every
+     * node so it can route operations to the correct partition owner.
+     * Failures are silently ignored — the periodic reconnection task will retry.
+     */
+    private connectToNonOwnerMembers(members: Member[]): void {
+        const ownerAddress = this.ownerConnection ? this.ownerConnection.getAddress().toString() : null;
+        
+        members.forEach((member) => {
+            const memberAddressStr = member.address.toString();
+            
+            // Skip the owner — already connected
+            if (memberAddressStr === ownerAddress) {
+                return;
+            }
+            
+            // Skip if already connected
+            if (this.client.getConnectionManager().hasConnection(member.address)) {
+                return;
+            }
+            
+            this.logger.info('ClusterService', 
+                `🔗 SMART-ROUTING: Opening connection to non-owner member ${memberAddressStr}`);
+            
+            this.client.getConnectionManager().getOrConnect(member.address, false)
+                .then(() => {
+                    this.logger.info('ClusterService', 
+                        `✅ SMART-ROUTING: Connected to member ${memberAddressStr}`);
+                })
+                .catch((err: any) => {
+                    this.logger.warn('ClusterService', 
+                        `⚠️ SMART-ROUTING: Could not connect to member ${memberAddressStr}: ${err.message}`);
+                });
+        });
     }
 
     private detectMembershipEvents(prevMembers: Member[]): MembershipEvent[] {
@@ -714,6 +757,28 @@ export class ClusterService {
         
         this.logger.info('ClusterService', 
             `✅ SERVER-FIRST: Member ${member.uuid} at ${member.address.toString()} credentials stored from server data`);
+        
+        // In smart routing mode, proactively open a connection to this member
+        // so it is immediately available for partition-aware routing.
+        if (this.client.getConfig().networkConfig.smartRouting) {
+            const ownerAddress = this.ownerConnection ? this.ownerConnection.getAddress().toString() : null;
+            const memberAddressStr = member.address.toString();
+            
+            if (memberAddressStr !== ownerAddress && !this.client.getConnectionManager().hasConnection(member.address)) {
+                this.logger.info('ClusterService', 
+                    `🔗 SMART-ROUTING: Opening connection to newly joined member ${memberAddressStr}`);
+                
+                this.client.getConnectionManager().getOrConnect(member.address, false)
+                    .then(() => {
+                        this.logger.info('ClusterService', 
+                            `✅ SMART-ROUTING: Connected to newly joined member ${memberAddressStr}`);
+                    })
+                    .catch((err: any) => {
+                        this.logger.warn('ClusterService', 
+                            `⚠️ SMART-ROUTING: Could not connect to newly joined member ${memberAddressStr}: ${err.message}`);
+                    });
+            }
+        }
     }
 
     /**
