@@ -330,27 +330,32 @@ export class ClusterService {
         this.client.getPartitionService().clearPartitionTable();
         
         // IMPORTANT: Unblock all down addresses before attempting reconnection.
-        // The address was just marked as down by onConnectionClosed/onHeartbeatStopped,
-        // but connectToCluster() skips blocked addresses — so without clearing the block
-        // it will immediately fail with "Unable to connect to any address".
-        // clearAllCredentials() already clears failedConnections inside ConnectionManager.
-        this.logger.info('ClusterService', '🔓 SINGLE-NODE RESET: Unblocking all addresses for fresh reconnection...');
-        this.downAddresses.clear();
-        
-        // Direct reconnection without waiting for member events
-        this.logger.info('ClusterService', '🔄 SINGLE-NODE RESET: Attempting direct reconnection...');
-        this.connectToCluster()
-            .then(() => {
-                this.logger.info('ClusterService', '✅ Single-node cluster reset completed successfully');
-                this.logCurrentState();
-            })
-            .catch((error) => {
-                this.logger.error('ClusterService', 'Single-node cluster reset failed', error);
-                this.logCurrentState();
-            })
-            .finally(() => {
-                this.failoverInProgress = false;
-            });
+        // We must clear BOTH blocklists:
+        //   1. this.downAddresses  — ClusterService-level block (checked by tryConnectingToAddresses)
+        //   2. failedConnections   — ClientConnectionManager-level block (checked by getOrConnect)
+        // We delay by 200ms to let any in-flight async destroyConnection() calls finish,
+        // because destroyConnection() re-adds the address to failedConnections after we clear it.
+        // Clearing both right before connectToCluster() ensures neither blocklist interferes.
+        this.logger.info('ClusterService', '🔓 SINGLE-NODE RESET: Scheduling reconnection after brief stabilization delay...');
+        setTimeout(() => {
+            // Clear both blocklists right before attempting reconnection
+            this.downAddresses.clear();
+            this.client.getConnectionManager().clearFailedConnections();
+            
+            this.logger.info('ClusterService', '🔄 SINGLE-NODE RESET: Attempting direct reconnection...');
+            this.connectToCluster()
+                .then(() => {
+                    this.logger.info('ClusterService', '✅ Single-node cluster reset completed successfully');
+                    this.logCurrentState();
+                })
+                .catch((error) => {
+                    this.logger.error('ClusterService', 'Single-node cluster reset failed', error);
+                    this.logCurrentState();
+                })
+                .finally(() => {
+                    this.failoverInProgress = false;
+                });
+        }, 200);
     }
 
     /**

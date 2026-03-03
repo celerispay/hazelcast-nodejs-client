@@ -146,8 +146,10 @@ export class ClientConnectionManager extends EventEmitter {
             this.failedConnections.delete(address.toString());
             return connection;
         }).catch((error) => {
-            // Check if it's an authentication error
-            const isAuthError = error.message && (
+            // Check if it's an authentication error.
+            // error.message may be null when the server sends a null-message protocol error
+            // (e.g. ReferenceError: null from ErrorFactory), so we check for null explicitly.
+            const isAuthError = (error.message == null) || (
                 error.message.includes('Invalid Credentials') ||
                 error.message.includes('authentication') ||
                 error.message.includes('credentials')
@@ -578,6 +580,19 @@ export class ClientConnectionManager extends EventEmitter {
         this.failedConnections.clear();
         
         this.logger.info('ClientConnectionManager', '✅ All credentials cleared, ready for fresh authentication');
+    }
+
+    /**
+     * Clears the failed connections blocklist so previously failed addresses
+     * can be retried immediately. Called after a cluster reset to ensure
+     * async destroyConnection() calls don't re-block addresses that were
+     * just unblocked for reconnection.
+     */
+    clearFailedConnections(): void {
+        const count = this.failedConnections.size;
+        this.failedConnections.clear();
+        this.logger.info('ClientConnectionManager', 
+            `🔓 Cleared ${count} failed connection entries, all addresses unblocked`);
     }
 
     /**
