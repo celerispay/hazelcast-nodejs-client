@@ -42,3 +42,18 @@ A: Not certain yet — engineer to confirm exact repro (map read-through via
 3. Add proactive reclamation of TTL-expired records independent of evictionPolicy
    (=NONE default) so expired memory is freed, not just hidden on read. Keep
    `0` = unlimited semantics and `expiredCount` accounting.
+
+### Reclamation must be INDEPENDENT of put/get (review revision, 2026-06-11)
+The user rejected hooking reclamation onto the write path: even a throttled per-`put()`
+sweep makes every put pay a time check, and the put that crosses the throttle window
+eats the full O(n) scan — degrading puts exactly at peak load. Reclamation MUST be
+decoupled from put/get:
+- Reclaim TTL-expired records from a **background scheduled task** (periodic timer),
+  NOT from `put()` / `tryReserveForUpdate()` / `get()`.
+- Model it on the existing near-cache background-maintenance pattern (`RepairingTask`)
+  — a `setInterval`-style periodic task is acceptable here (precedent exists).
+- Lifecycle: start the task with the near cache, and STOP/clear it on the near cache's
+  destroy/clear so no timer leaks.
+- Remove the `doExpiration()` calls from the write path. The lazy `get()`-path expiry
+  stays as the correctness guarantee; the background task handles memory reclamation.
+- TTL only (`isExpired(0)`); max-idle stays lazy/read-triggered. Preserve `expiredCount`.
