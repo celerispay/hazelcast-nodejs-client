@@ -173,3 +173,14 @@ expiry tests) run without a cluster; the cluster-backed `describe` blocks need a
 
 (The intermediate `af14e1df` write-path throttle was superseded by the T4 background-task
 rework after the user rejected coupling reclamation to the write path.)
+
+## ⚠ Known Issue — pending fix before release (added 2026-06-11 post-audit)
+A pre-release audit (regression/security/memory) found the background TTL sweep design
+has a **HIGH memory/timer leak (L1)**: `map.destroy()` skips near-cache teardown
+(`postDestroy` → `destroyNearCache`) when the server destroy round-trip rejects (cluster
+instability), leaving a per-cache 1s `setInterval` + store firing until client shutdown.
+Also wasted work for the default no-TTL config (L5) and N timers for N maps (L6).
+Regression and security are CLEAN (security is a net improvement). **Do not release until
+L1 is fixed.** Planned rework: move the sweep to a single `NearCacheManager`-level timer
+gated on `timeToLiveSeconds > 0`, dropping the per-`NearCacheImpl` timer (resolves
+L1+L2+L5+L6). Full detail and fix plan: `.sdlc/pre-release-audit.md`.

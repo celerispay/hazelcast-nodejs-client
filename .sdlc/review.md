@@ -30,3 +30,11 @@ Action: Fix recommended before merge — address the HIGH per-write O(n) sweep (
 - MEDIUM (setCreationTime ignores arg): fixed 29c92c50 — clarified guard comment (deliberate arg-drop for absolute-TTL).
 - LOW (max-idle test on cluster fixture): fixed 29c92c50 — moved to top-level sibling describe, no cluster before-hook, destroy() teardown added.
 - LOW (doExpiration protected): accepted — convention-consistent, no action.
+
+## Pre-Release Audit (2026-06-11) — deferred to next session
+- L1 (HIGH): near-cache timer+store leak when map.destroy() server round-trip fails (postDestroy skipped on reject). decision: DEFERRED — rework planned next session. See .sdlc/pre-release-audit.md.
+- L2 (MEDIUM): orphaned timer on proxy-create failure. decision: DEFERRED (fixed-for-free by L1 rework).
+- L5 (LOW-MED): unconditional 1s full-store sweep even for default ttl=0 config (wasted work). decision: DEFERRED.
+- L6 (MEDIUM): N per-cache timers vs single shared scheduler. decision: DEFERRED.
+- Regression audit: SAFE. Security audit: SAFE (net improvement). No code changed during audit.
+- PLANNED FIX: move sweep to a single NearCacheManager-level task gated on ttl>0; drop per-NearCacheImpl setInterval. Resolves L1+L2+L5+L6.
