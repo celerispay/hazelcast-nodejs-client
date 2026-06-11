@@ -129,6 +129,7 @@ export class NearCacheImpl implements NearCache {
         const internalRecord = this.internalStore.get(key);
         const resId = this.nextReservationId();
         if (internalRecord === undefined) {
+            this.doExpiration();
             this.doEvictionIfRequired();
             const dr = new DataRecord(key, undefined, undefined, this.timeToLiveSeconds);
             dr.casStatus(DataRecord.READ_PERMITTED, resId);
@@ -174,6 +175,7 @@ export class NearCacheImpl implements NearCache {
      * @param value
      */
     put(key: Data, value: any): void {
+        this.doExpiration();
         this.doEvictionIfRequired();
         if (this.inMemoryFormat === InMemoryFormat.OBJECT) {
             value = this.serializationService.toObject(value);
@@ -240,6 +242,23 @@ export class NearCacheImpl implements NearCache {
             entryCount: this.internalStore.size,
         };
         return stats;
+    }
+
+    /**
+     * Proactively reclaims TTL-expired records regardless of the eviction policy.
+     * Runs on the write/publish path so that ttl>0 records are freed even when the
+     * eviction policy is NONE and the key is never read again. Only the absolute TTL
+     * window is considered here (isExpired(0) disables the max-idle branch); max-idle
+     * eviction stays lazy on the read path. Removal goes through expireRecord() so
+     * expiredCount accounting stays consistent.
+     */
+    protected doExpiration(): void {
+        const records: DataRecord[] = Array.from(this.internalStore.values());
+        for (const record of records) {
+            if (record.isExpired(0)) {
+                this.expireRecord(record.key);
+            }
+        }
     }
 
     protected isEvictionRequired(): boolean {
