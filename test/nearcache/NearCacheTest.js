@@ -278,29 +278,6 @@ describe('NearCacheImpl', function () {
         });
     });
 
-    describe('max-idle reset-on-read', function () {
-
-        it('max-idle still resets on read', function () {
-            var ncc = new Config.NearCacheConfig();
-            ncc.maxIdleSeconds = 1;
-            ncc.evictionMaxSize = 100;
-            ncc.evictionPolicy = EvictionPolicy.NONE;
-            var nearCache = new NearCacheImpl(ncc, createSerializationService());
-            nearCache.setReady();
-            nearCache.put(ds('key'), 'val');
-            // Each promiseBefore read (~250ms) falls inside the 1s idle window and
-            // resets the idle timer. After 4 reads (~1000ms+) the cumulative elapsed
-            // time exceeds the ORIGINAL maxIdle window, yet the entry is still present
-            // because every read kept it alive — confirming reset-on-read.
-            function readKey() {
-                return promiseBefore(ncc.maxIdleSeconds, nearCache.get.bind(nearCache, ds('key')));
-            }
-            return readKey().then(readKey).then(readKey).then(readKey).then(function (res) {
-                return expect(res).to.equal('val');
-            });
-        });
-    });
-
     describe('InMemory format', function () {
 
         it('Object', function () {
@@ -333,4 +310,58 @@ describe('NearCacheImpl', function () {
         return promiseLater(boundaryInSec * 1500, func);
     }
 
+});
+
+// This is a pure in-process test: it constructs a NearCacheImpl directly and
+// never touches a real cluster, so it lives in its own top-level describe with
+// NO cluster-starting before/after hooks (avoiding needless startup cost).
+describe('NearCacheImpl max-idle reset-on-read', function () {
+
+    function ds(str) {
+        return {
+            val: str,
+            hashCode: function () {
+                return str[0] - 'a';
+            },
+            equals(other) {
+                return this.val === other.val;
+            }
+        }
+    }
+
+    function createSerializationService() {
+        var cfg = new Config.ClientConfig().serializationConfig;
+        return new SerializationService(undefined, cfg);
+    }
+
+    function promiseBefore(boundaryInSec, func) {
+        return promiseLater(boundaryInSec * 250, func);
+    }
+
+    it('max-idle still resets on read', function () {
+        var ncc = new Config.NearCacheConfig();
+        ncc.maxIdleSeconds = 1;
+        ncc.evictionMaxSize = 100;
+        ncc.evictionPolicy = EvictionPolicy.NONE;
+        var nearCache = new NearCacheImpl(ncc, createSerializationService());
+        nearCache.setReady();
+        nearCache.put(ds('key'), 'val');
+        // Each promiseBefore read (~250ms) falls inside the 1s idle window and
+        // resets the idle timer. After 4 reads (~1000ms+) the cumulative elapsed
+        // time exceeds the ORIGINAL maxIdle window, yet the entry is still present
+        // because every read kept it alive — confirming reset-on-read.
+        function readKey() {
+            return promiseBefore(ncc.maxIdleSeconds, nearCache.get.bind(nearCache, ds('key')));
+        }
+        return readKey().then(readKey).then(readKey).then(readKey).then(function (res) {
+            expect(res).to.equal('val');
+            // Stop the background TTL sweep timer so no setInterval leaks and
+            // mocha can exit cleanly (success path).
+            nearCache.destroy();
+        }).catch(function (err) {
+            // Ensure the timer is cleared on the error path too, then rethrow.
+            nearCache.destroy();
+            throw err;
+        });
+    });
 });
