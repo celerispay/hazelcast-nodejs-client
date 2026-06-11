@@ -27,6 +27,15 @@ import {DataRecord} from './DataRecord';
 import {StaleReadDetector} from './StaleReadDetector';
 import * as Promise from 'bluebird';
 
+/**
+ * Minimum interval, in milliseconds, between two proactive TTL sweeps. The sweep
+ * snapshots and scans the whole store, so running it on every write is an O(n)
+ * per-write cost. Throttling keeps it off the hot path while still reclaiming
+ * never-read TTL-expired records periodically. The lazy get() path continues to
+ * expire individual records on read regardless of this interval.
+ */
+const EXPIRATION_TASK_INTERVAL_MS = 1000;
+
 export interface NearCacheStatistics {
     creationTime: number;
     evictedCount: number;
@@ -76,6 +85,7 @@ export class NearCacheImpl implements NearCache {
     private evictionCandidatePool: DataRecord[];
     private staleReadDetector: StaleReadDetector = AlwaysFreshStaleReadDetectorImpl.INSTANCE;
     private reservationCounter: Long = Long.ZERO;
+    private lastExpirationTime: number = 0;
 
     private evictedCount: number = 0;
     private expiredCount: number = 0;
@@ -250,9 +260,16 @@ export class NearCacheImpl implements NearCache {
      * eviction policy is NONE and the key is never read again. Only the absolute TTL
      * window is considered here (isExpired(0) disables the max-idle branch); max-idle
      * eviction stays lazy on the read path. Removal goes through expireRecord() so
-     * expiredCount accounting stays consistent.
+     * expiredCount accounting stays consistent. Throttled to at most once per
+     * EXPIRATION_TASK_INTERVAL_MS so the O(n) snapshot+scan stays off the hot write
+     * path; the first call always runs since lastExpirationTime starts at 0.
      */
     protected doExpiration(): void {
+        const now = Date.now();
+        if (now < this.lastExpirationTime + EXPIRATION_TASK_INTERVAL_MS) {
+            return;
+        }
+        this.lastExpirationTime = now;
         const records: DataRecord[] = Array.from(this.internalStore.values());
         for (const record of records) {
             if (record.isExpired(0)) {
