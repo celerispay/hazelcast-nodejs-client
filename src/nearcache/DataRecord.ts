@@ -115,6 +115,12 @@ export class DataRecord {
     }
 
     setCreationTime(creationTime?: number): void {
+        // TTL is absolute from the original put: once a ttl>0 record has its
+        // expirationTime computed (in the constructor), the read-through publish
+        // path must not re-stamp it against the latest cluster refresh.
+        if (this.ttl > 0 && this.expirationTime > 0) {
+            return;
+        }
         if (creationTime) {
             this.creationTime = creationTime;
         } else {
