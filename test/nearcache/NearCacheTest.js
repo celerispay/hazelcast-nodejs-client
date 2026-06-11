@@ -253,14 +253,24 @@ describe('NearCacheImpl', function () {
                 if (nearCache.evictionPolicy !== EvictionPolicy.NONE || nearCache.timeToLiveSeconds === 0) {
                     this.skip();
                 }
+                // The near cache is created normally in beforeEach, so its background
+                // TTL sweep timer (EXPIRATION_TASK_INTERVAL_MS = 1000ms) is already
+                // running. Put the orphan, then wait long enough that BOTH the TTL has
+                // elapsed AND at least one background sweep tick has fired. We never read
+                // the orphan and never issue a second put — reclamation is driven purely
+                // by the background task. promiseAfter waits ttl*1500ms (1500ms for ttl=1),
+                // which exceeds the 1000ms TTL and the 1000ms sweep cadence.
                 nearCache.put(ds('orphan'), 'orphanval');
                 promiseAfter(nearCache.timeToLiveSeconds, function () {
                     try {
-                        nearCache.put(ds('trigger'), 'triggerval');
                         expect(nearCache.getStatistics().expiredCount).to.greaterThan(0);
-                        expect(nearCache.getStatistics().entryCount).to.equal(1);
+                        expect(nearCache.getStatistics().entryCount).to.equal(0);
+                        // Stop the background timer (same teardown NearCacheManager uses)
+                        // so no setInterval leaks and the test process can exit cleanly.
+                        nearCache.destroy();
                         done();
                     } catch (e) {
+                        nearCache.destroy();
                         done(e);
                     }
                 });
