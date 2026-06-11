@@ -27,3 +27,6 @@ Action: Fix recommended before merge — address the HIGH per-write O(n) sweep (
 - MEDIUM (setCreationTime ignores arg for ttl>0): informational, no action
 - LOW x2 (max-idle test cost/timing): informational, no action
 - HIGH rework (2026-06-11): user rejected write-path-coupled sweep. Reworked in T4 (4bfb07f7) -> reclamation now a background setInterval task (mirrors RepairingTask), .unref()+destroy() teardown via NearCacheManager.destroyNearCache; doExpiration removed from put()/tryReserveForUpdate. Fully decoupled from put/get.
+- MEDIUM (setCreationTime ignores arg): fixed 29c92c50 — clarified guard comment (deliberate arg-drop for absolute-TTL).
+- LOW (max-idle test on cluster fixture): fixed 29c92c50 — moved to top-level sibling describe, no cluster before-hook, destroy() teardown added.
+- LOW (doExpiration protected): accepted — convention-consistent, no action.
