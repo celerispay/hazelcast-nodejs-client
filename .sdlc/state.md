@@ -1,5 +1,5 @@
 project: hazelcast-client | type: Bugfix | size: S | nature: backend
-phase: ship | step: 4/4 | branch: celeris/hazelcast-client-20260611193120 | base: 3.12.x
+phase: done | step: 4/4 | branch: 3.12.x | base: 3.12.x
 worktree: none
 tasks: T1✓ T2✓ T3✓ T4✓ T5✓
 para: A=T1,T2 B=T3 C=T4 D=T5
