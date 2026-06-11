@@ -28,11 +28,11 @@ import {StaleReadDetector} from './StaleReadDetector';
 import * as Promise from 'bluebird';
 
 /**
- * Minimum interval, in milliseconds, between two proactive TTL sweeps. The sweep
- * snapshots and scans the whole store, so running it on every write is an O(n)
- * per-write cost. Throttling keeps it off the hot path while still reclaiming
- * never-read TTL-expired records periodically. The lazy get() path continues to
- * expire individual records on read regardless of this interval.
+ * Cadence, in milliseconds, of the background proactive TTL sweep. The sweep
+ * snapshots and scans the whole store, so it runs on its own timer rather than
+ * on the write/read path — keeping the O(n) scan off the hot put/get path while
+ * still reclaiming never-read TTL-expired records periodically. The lazy get()
+ * path continues to expire individual records on read regardless of this timer.
  */
 const EXPIRATION_TASK_INTERVAL_MS = 1000;
 
@@ -67,6 +67,8 @@ export interface NearCache {
     tryPublishReserved(key: Data, value: any, reservationId: Long): any;
 
     setReady(): void;
+
+    destroy(): void;
 }
 
 export class NearCacheImpl implements NearCache {
@@ -85,7 +87,7 @@ export class NearCacheImpl implements NearCache {
     private evictionCandidatePool: DataRecord[];
     private staleReadDetector: StaleReadDetector = AlwaysFreshStaleReadDetectorImpl.INSTANCE;
     private reservationCounter: Long = Long.ZERO;
-    private lastExpirationTime: number = 0;
+    private expirationTaskHandle: any;
 
     private evictedCount: number = 0;
     private expiredCount: number = 0;
@@ -119,6 +121,7 @@ export class NearCacheImpl implements NearCache {
         this.evictionCandidatePool = [];
         this.internalStore = new DataKeyedHashMap<DataRecord>();
         this.ready = DeferredPromise();
+        this.startExpirationTask();
     }
 
     setReady(): void {
@@ -139,7 +142,6 @@ export class NearCacheImpl implements NearCache {
         const internalRecord = this.internalStore.get(key);
         const resId = this.nextReservationId();
         if (internalRecord === undefined) {
-            this.doExpiration();
             this.doEvictionIfRequired();
             const dr = new DataRecord(key, undefined, undefined, this.timeToLiveSeconds);
             dr.casStatus(DataRecord.READ_PERMITTED, resId);
@@ -185,7 +187,6 @@ export class NearCacheImpl implements NearCache {
      * @param value
      */
     put(key: Data, value: any): void {
-        this.doExpiration();
         this.doEvictionIfRequired();
         if (this.inMemoryFormat === InMemoryFormat.OBJECT) {
             value = this.serializationService.toObject(value);
@@ -238,6 +239,19 @@ export class NearCacheImpl implements NearCache {
         this.internalStore.clear();
     }
 
+    /**
+     * Tears down the near cache. Stops the background TTL sweep timer and clears
+     * the store. Mirrors RepairingTask.shutdown(): the interval handle is cleared
+     * guarded by a null check so no timer leaks once the cache is destroyed.
+     */
+    destroy(): void {
+        if (this.expirationTaskHandle != null) {
+            clearInterval(this.expirationTaskHandle);
+            this.expirationTaskHandle = undefined;
+        }
+        this.internalStore.clear();
+    }
+
     isInvalidatedOnChange(): boolean {
         return this.invalidateOnChange;
     }
@@ -255,21 +269,28 @@ export class NearCacheImpl implements NearCache {
     }
 
     /**
+     * Starts the background TTL sweep on a fixed cadence. Mirrors RepairingTask:
+     * the interval handle is stored on the instance and cleared on destroy(). The
+     * handle is unref()'d so a near cache with a live timer never keeps the Node
+     * process alive on its own — the sweep only matters while the process is
+     * otherwise busy.
+     */
+    protected startExpirationTask(): void {
+        this.expirationTaskHandle = setInterval(this.doExpiration.bind(this), EXPIRATION_TASK_INTERVAL_MS);
+        if (typeof this.expirationTaskHandle.unref === 'function') {
+            this.expirationTaskHandle.unref();
+        }
+    }
+
+    /**
      * Proactively reclaims TTL-expired records regardless of the eviction policy.
-     * Runs on the write/publish path so that ttl>0 records are freed even when the
-     * eviction policy is NONE and the key is never read again. Only the absolute TTL
-     * window is considered here (isExpired(0) disables the max-idle branch); max-idle
-     * eviction stays lazy on the read path. Removal goes through expireRecord() so
-     * expiredCount accounting stays consistent. Throttled to at most once per
-     * EXPIRATION_TASK_INTERVAL_MS so the O(n) snapshot+scan stays off the hot write
-     * path; the first call always runs since lastExpirationTime starts at 0.
+     * Runs on its own background timer (see startExpirationTask) — fully decoupled
+     * from the put/get path so writes never pay for the O(n) snapshot+scan. Only the
+     * absolute TTL window is considered here (isExpired(0) disables the max-idle
+     * branch); max-idle eviction stays lazy on the read path. Removal goes through
+     * expireRecord() so expiredCount accounting stays consistent.
      */
     protected doExpiration(): void {
-        const now = Date.now();
-        if (now < this.lastExpirationTime + EXPIRATION_TASK_INTERVAL_MS) {
-            return;
-        }
-        this.lastExpirationTime = now;
         const records: DataRecord[] = Array.from(this.internalStore.values());
         for (const record of records) {
             if (record.isExpired(0)) {
