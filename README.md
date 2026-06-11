@@ -167,6 +167,14 @@ npm test
 
 Test script automatically downloads `hazelcast-remote-controller` and Hazelcast IMDG. The script uses Maven to download those.
 
+## Recent Fixes
+
+- **Near-cache TTL entries not expiring** (`src/nearcache/`): TTL is now absolute from the
+  original put — the read-through publish path no longer re-stamps `expirationTime` on each
+  cluster refresh, and a background sweep proactively reclaims TTL-expired records regardless
+  of `evictionPolicy`. No public API / `NearCacheConfig` change. See [`HANDOFF.md`](HANDOFF.md)
+  for details and the deferred cluster-based verification steps required before release.
+
 ## License
 
 [Apache 2 License](LICENSE).

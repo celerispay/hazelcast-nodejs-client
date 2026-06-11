@@ -43,7 +43,7 @@ export class NearCacheManager {
         const nearCache = this.caches.get(name);
         if (nearCache != null) {
             this.caches.delete(name);
-            nearCache.clear();
+            nearCache.destroy();
         }
     }
 

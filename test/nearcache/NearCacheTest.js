@@ -237,6 +237,44 @@ describe('NearCacheImpl', function () {
                     }
                 });
             });
+
+            it('ttl expires even with an intervening read inside the window', function () {
+                if (nearCache.timeToLiveSeconds == 0) {
+                    this.skip();
+                }
+                nearCache.put(ds('key'), 'val');
+                return promiseBefore(testConfig.timeToLiveSeconds, nearCache.get.bind(nearCache, ds('key'))).then(function (mid) {
+                    expect(mid).to.equal('val');
+                    return expect(promiseAfter(testConfig.timeToLiveSeconds, nearCache.get.bind(nearCache, ds('key')))).to.eventually.be.undefined;
+                });
+            });
+
+            it('proactively reclaims a ttl-expired entry that is never read again', function (done) {
+                if (nearCache.evictionPolicy !== EvictionPolicy.NONE || nearCache.timeToLiveSeconds === 0) {
+                    this.skip();
+                }
+                // The near cache is created normally in beforeEach, so its background
+                // TTL sweep timer (EXPIRATION_TASK_INTERVAL_MS = 1000ms) is already
+                // running. Put the orphan, then wait long enough that BOTH the TTL has
+                // elapsed AND at least one background sweep tick has fired. We never read
+                // the orphan and never issue a second put — reclamation is driven purely
+                // by the background task. promiseAfter waits ttl*1500ms (1500ms for ttl=1),
+                // which exceeds the 1000ms TTL and the 1000ms sweep cadence.
+                nearCache.put(ds('orphan'), 'orphanval');
+                promiseAfter(nearCache.timeToLiveSeconds, function () {
+                    try {
+                        expect(nearCache.getStatistics().expiredCount).to.greaterThan(0);
+                        expect(nearCache.getStatistics().entryCount).to.equal(0);
+                        // Stop the background timer (same teardown NearCacheManager uses)
+                        // so no setInterval leaks and the test process can exit cleanly.
+                        nearCache.destroy();
+                        done();
+                    } catch (e) {
+                        nearCache.destroy();
+                        done(e);
+                    }
+                });
+            });
         });
     });
 
@@ -272,4 +310,58 @@ describe('NearCacheImpl', function () {
         return promiseLater(boundaryInSec * 1500, func);
     }
 
+});
+
+// This is a pure in-process test: it constructs a NearCacheImpl directly and
+// never touches a real cluster, so it lives in its own top-level describe with
+// NO cluster-starting before/after hooks (avoiding needless startup cost).
+describe('NearCacheImpl max-idle reset-on-read', function () {
+
+    function ds(str) {
+        return {
+            val: str,
+            hashCode: function () {
+                return str[0] - 'a';
+            },
+            equals(other) {
+                return this.val === other.val;
+            }
+        }
+    }
+
+    function createSerializationService() {
+        var cfg = new Config.ClientConfig().serializationConfig;
+        return new SerializationService(undefined, cfg);
+    }
+
+    function promiseBefore(boundaryInSec, func) {
+        return promiseLater(boundaryInSec * 250, func);
+    }
+
+    it('max-idle still resets on read', function () {
+        var ncc = new Config.NearCacheConfig();
+        ncc.maxIdleSeconds = 1;
+        ncc.evictionMaxSize = 100;
+        ncc.evictionPolicy = EvictionPolicy.NONE;
+        var nearCache = new NearCacheImpl(ncc, createSerializationService());
+        nearCache.setReady();
+        nearCache.put(ds('key'), 'val');
+        // Each promiseBefore read (~250ms) falls inside the 1s idle window and
+        // resets the idle timer. After 4 reads (~1000ms+) the cumulative elapsed
+        // time exceeds the ORIGINAL maxIdle window, yet the entry is still present
+        // because every read kept it alive — confirming reset-on-read.
+        function readKey() {
+            return promiseBefore(ncc.maxIdleSeconds, nearCache.get.bind(nearCache, ds('key')));
+        }
+        return readKey().then(readKey).then(readKey).then(readKey).then(function (res) {
+            expect(res).to.equal('val');
+            // Stop the background TTL sweep timer so no setInterval leaks and
+            // mocha can exit cleanly (success path).
+            nearCache.destroy();
+        }).catch(function (err) {
+            // Ensure the timer is cleared on the error path too, then rethrow.
+            nearCache.destroy();
+            throw err;
+        });
+    });
 });
