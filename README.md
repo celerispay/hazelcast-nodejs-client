@@ -172,8 +172,11 @@ Test script automatically downloads `hazelcast-remote-controller` and Hazelcast 
 - **Near-cache TTL entries not expiring** (`src/nearcache/`): TTL is now absolute from the
   original put — the read-through publish path no longer re-stamps `expirationTime` on each
   cluster refresh, and a background sweep proactively reclaims TTL-expired records regardless
-  of `evictionPolicy`. No public API / `NearCacheConfig` change. See [`HANDOFF.md`](HANDOFF.md)
-  for details and the deferred cluster-based verification steps required before release.
+  of `evictionPolicy`. Reclamation runs on a single shared `NearCacheManager` timer
+  (`.unref()`'d, skips no-TTL caches) draining a per-cache FIFO expiry queue from the front —
+  fixing a per-cache timer/memory leak and removing the per-second full-cache scan. No public
+  API / `NearCacheConfig` change. See [`HANDOFF.md`](HANDOFF.md) for details and the deferred
+  cluster-based verification steps required before release.
 
 ## License
 
