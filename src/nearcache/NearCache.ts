@@ -28,13 +28,22 @@ import {StaleReadDetector} from './StaleReadDetector';
 import * as Promise from 'bluebird';
 
 /**
- * Cadence, in milliseconds, of the background proactive TTL sweep. The sweep
- * snapshots and scans the whole store, so it runs on its own timer rather than
- * on the write/read path — keeping the O(n) scan off the hot put/get path while
- * still reclaiming never-read TTL-expired records periodically. The lazy get()
- * path continues to expire individual records on read regardless of this timer.
+ * One pending TTL expiration. Captures the record's key and the absolute
+ * expirationTime it had when enqueued, so a later drain can detect a superseded
+ * generation (overwrite) by comparing against the live record's expirationTime.
  */
-const EXPIRATION_TASK_INTERVAL_MS = 1000;
+interface ExpirationQueueEntry {
+    key: Data;
+    expirationTime: number;
+}
+
+/**
+ * When the expiration queue's logical length (live entries behind the head
+ * cursor) exceeds this multiple of internalStore.size, it is compacted to drop
+ * stale elements (key gone, or generation superseded). Bounds queue growth under
+ * heavy overwrite/delete churn without paying an O(n) search on every delete.
+ */
+const EXPIRATION_QUEUE_STALE_FACTOR = 2;
 
 export interface NearCacheStatistics {
     creationTime: number;
@@ -69,6 +78,10 @@ export interface NearCache {
     setReady(): void;
 
     destroy(): void;
+
+    getTimeToLiveSeconds(): number;
+
+    doExpiration(): void;
 }
 
 export class NearCacheImpl implements NearCache {
@@ -87,7 +100,6 @@ export class NearCacheImpl implements NearCache {
     private evictionCandidatePool: DataRecord[];
     private staleReadDetector: StaleReadDetector = AlwaysFreshStaleReadDetectorImpl.INSTANCE;
     private reservationCounter: Long = Long.ZERO;
-    private expirationTaskHandle: any;
 
     private evictedCount: number = 0;
     private expiredCount: number = 0;
@@ -96,6 +108,25 @@ export class NearCacheImpl implements NearCache {
     private creationTime = Date.now();
     private compareFunc: (x: DataRecord, y: DataRecord) => number;
     private ready: Promise.Resolver<void>;
+
+    /**
+     * Insertion-ordered FIFO of pending TTL expirations. Within one near cache
+     * timeToLiveSeconds is constant and (post-T1) expirationTime is absolute and
+     * never slides on read, so put-order == expiration-order: the head is always
+     * the soonest to expire. doExpiration drains expired entries from the front
+     * and stops at the first non-expired head — O(number expiring this tick),
+     * never an O(n) full-store scan or sort.
+     *
+     * Implemented as a plain array plus a head cursor (expirationQueueHead): the
+     * tail grows via push() (O(1) amortized) and the front is consumed by
+     * advancing the cursor (O(1)) rather than Array.prototype.shift() (O(n)). The
+     * consumed prefix is reclaimed by a slice() compaction once the cursor passes
+     * the array midpoint (see compactExpirationQueueIfNeeded). Stale entries (from
+     * delete/eviction/overwrite) are dropped lazily on drain; unbounded stale
+     * growth under churn is bounded by EXPIRATION_QUEUE_STALE_FACTOR compaction.
+     */
+    private expirationQueue: ExpirationQueueEntry[] = [];
+    private expirationQueueHead: number = 0;
 
     constructor(nearCacheConfig: NearCacheConfig, serializationService: SerializationService) {
         this.serializationService = serializationService;
@@ -121,7 +152,10 @@ export class NearCacheImpl implements NearCache {
         this.evictionCandidatePool = [];
         this.internalStore = new DataKeyedHashMap<DataRecord>();
         this.ready = DeferredPromise();
-        this.startExpirationTask();
+    }
+
+    getTimeToLiveSeconds(): number {
+        return this.timeToLiveSeconds;
     }
 
     setReady(): void {
@@ -146,6 +180,7 @@ export class NearCacheImpl implements NearCache {
             const dr = new DataRecord(key, undefined, undefined, this.timeToLiveSeconds);
             dr.casStatus(DataRecord.READ_PERMITTED, resId);
             this.internalStore.set(key, dr);
+            this.enqueueExpiration(dr);
             return resId;
         }
         if (internalRecord.casStatus(DataRecord.READ_PERMITTED, resId)) {
@@ -196,6 +231,7 @@ export class NearCacheImpl implements NearCache {
         const dr = new DataRecord(key, value, undefined, this.timeToLiveSeconds);
         this.initInvalidationMetadata(dr);
         this.internalStore.set(key, dr);
+        this.enqueueExpiration(dr);
     }
 
     /**
@@ -237,19 +273,19 @@ export class NearCacheImpl implements NearCache {
 
     clear(): void {
         this.internalStore.clear();
+        this.resetExpirationQueue();
     }
 
     /**
-     * Tears down the near cache. Stops the background TTL sweep timer and clears
-     * the store. Mirrors RepairingTask.shutdown(): the interval handle is cleared
-     * guarded by a null check so no timer leaks once the cache is destroyed.
+     * Tears down the near cache by clearing the store (and the expiration queue,
+     * so it does not survive teardown). The TTL sweep is owned by
+     * NearCacheManager's shared timer, not by this instance, so there is no
+     * per-cache timer to clear here — a missed proxy-destroy degrades to benign
+     * dormant retention rather than a live leaked timer.
      */
     destroy(): void {
-        if (this.expirationTaskHandle != null) {
-            clearInterval(this.expirationTaskHandle);
-            this.expirationTaskHandle = undefined;
-        }
         this.internalStore.clear();
+        this.resetExpirationQueue();
     }
 
     isInvalidatedOnChange(): boolean {
@@ -269,33 +305,99 @@ export class NearCacheImpl implements NearCache {
     }
 
     /**
-     * Starts the background TTL sweep on a fixed cadence. Mirrors RepairingTask:
-     * the interval handle is stored on the instance and cleared on destroy(). The
-     * handle is unref()'d so a near cache with a live timer never keeps the Node
-     * process alive on its own — the sweep only matters while the process is
-     * otherwise busy.
+     * Proactively reclaims TTL-expired records regardless of the eviction policy.
+     * Driven by NearCacheManager's single shared background timer (the manager
+     * skips caches whose timeToLiveSeconds is 0) — fully decoupled from the
+     * put/get path so writes never pay for any scan.
+     *
+     * Drains expired entries from the FRONT of the insertion-ordered expiration
+     * queue and stops at the first non-expired head (everything behind it was put
+     * later and, with constant ttl + absolute expirationTime, expires later). Cost
+     * is O(number of entries expiring this tick), not O(store size). Only the
+     * absolute TTL window is considered (isExpired(0) disables the max-idle
+     * branch); max-idle eviction stays lazy on the read path. Removal goes through
+     * expireRecord() so expiredCount accounting stays consistent.
+     *
+     * Stale queue elements (key deleted/evicted, or a newer generation re-put with
+     * a later expirationTime) are dropped lazily here: a head whose key is gone, or
+     * whose live record no longer carries the queued expirationTime, is popped and
+     * skipped without touching the store.
      */
-    protected startExpirationTask(): void {
-        this.expirationTaskHandle = setInterval(this.doExpiration.bind(this), EXPIRATION_TASK_INTERVAL_MS);
-        if (typeof this.expirationTaskHandle.unref === 'function') {
-            this.expirationTaskHandle.unref();
+    doExpiration(): void {
+        const now = Date.now();
+        while (this.expirationQueueHead < this.expirationQueue.length) {
+            const head = this.expirationQueue[this.expirationQueueHead];
+            if (head.expirationTime > now) {
+                break;
+            }
+            this.expirationQueueHead++;
+            const cur = this.internalStore.get(head.key);
+            if (cur === undefined) {
+                continue;
+            }
+            if (cur.getExpirationTime() !== head.expirationTime) {
+                continue;
+            }
+            if (cur.isExpired(0)) {
+                this.expireRecord(head.key);
+            }
         }
+        this.compactExpirationQueueIfNeeded();
     }
 
     /**
-     * Proactively reclaims TTL-expired records regardless of the eviction policy.
-     * Runs on its own background timer (see startExpirationTask) — fully decoupled
-     * from the put/get path so writes never pay for the O(n) snapshot+scan. Only the
-     * absolute TTL window is considered here (isExpired(0) disables the max-idle
-     * branch); max-idle eviction stays lazy on the read path. Removal goes through
-     * expireRecord() so expiredCount accounting stays consistent.
+     * Appends a pending TTL expiration for a record with a finite expirationTime
+     * (ttl > 0). ttl=0 (unlimited) records are never enqueued and so are never
+     * swept. Re-put of an existing key appends a new (later) element; the prior
+     * element becomes stale and is dropped lazily on drain.
      */
-    protected doExpiration(): void {
-        const records: DataRecord[] = Array.from(this.internalStore.values());
-        for (const record of records) {
-            if (record.isExpired(0)) {
-                this.expireRecord(record.key);
+    private enqueueExpiration(dr: DataRecord): void {
+        const expirationTime = dr.getExpirationTime();
+        if (expirationTime > 0) {
+            this.expirationQueue.push({key: dr.key, expirationTime});
+        }
+    }
+
+    private resetExpirationQueue(): void {
+        this.expirationQueue = [];
+        this.expirationQueueHead = 0;
+    }
+
+    /**
+     * Reclaims the consumed prefix and bounds stale growth. Two cheap triggers:
+     * (1) once the head cursor passes the array midpoint, slice off the consumed
+     * prefix so the backing array does not grow without bound; (2) when the number
+     * of live (un-drained) entries exceeds EXPIRATION_QUEUE_STALE_FACTOR * store
+     * size, rebuild the queue keeping only elements whose key still maps to a
+     * record carrying the same expirationTime — dropping accumulated stale churn.
+     */
+    private compactExpirationQueueIfNeeded(): void {
+        const liveLength = this.expirationQueue.length - this.expirationQueueHead;
+        const overStale = liveLength > EXPIRATION_QUEUE_STALE_FACTOR * this.internalStore.size;
+        if (overStale) {
+            // Keep at most ONE element per live record: an element survives only if
+            // its key still maps to a record carrying the same expirationTime AND no
+            // earlier element for that key was already kept. This collapses duplicate
+            // same-key/same-ms generations (rapid overwrite churn) so the retained
+            // queue is bounded by the number of distinct live records, not by churn.
+            const rebuilt: ExpirationQueueEntry[] = [];
+            const seenKeys = new DataKeyedHashMap<boolean>();
+            for (let i = this.expirationQueueHead; i < this.expirationQueue.length; i++) {
+                const entry = this.expirationQueue[i];
+                if (seenKeys.get(entry.key) !== undefined) {
+                    continue;
+                }
+                const cur = this.internalStore.get(entry.key);
+                if (cur !== undefined && cur.getExpirationTime() === entry.expirationTime) {
+                    rebuilt.push(entry);
+                    seenKeys.set(entry.key, true);
+                }
             }
+            this.expirationQueue = rebuilt;
+            this.expirationQueueHead = 0;
+        } else if (this.expirationQueueHead > this.expirationQueue.length / 2) {
+            this.expirationQueue = this.expirationQueue.slice(this.expirationQueueHead);
+            this.expirationQueueHead = 0;
         }
     }
 
