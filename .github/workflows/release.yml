@@ -48,10 +48,10 @@ jobs:
           fi
 
       - name: Install dependencies
-        # NOTE: package-lock.json is git-ignored in this repo, so `npm ci` cannot
-        # run. Commit a lockfile and switch this to `npm ci` for reproducible,
-        # faster installs.
-        run: npm install --no-audit --no-fund
+        # Reproducible install from the committed package-lock.json. Fails if
+        # package.json and the lockfile drift, so a release can never resolve an
+        # unexpected (and possibly incompatible) transitive version.
+        run: npm ci --no-audit --no-fund
 
       - name: Build (tsc -> lib/)
         run: npm run compile

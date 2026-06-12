@@ -35,7 +35,6 @@ docs/
 # Mac desktop service store files
 *.DS_Store
 
-package-lock.json
 .dual-graph/
 
 # Heap snapshots — kept locally for profiling, never committed
