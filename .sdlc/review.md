@@ -1,40 +1,115 @@
-## Review: all | Status: PASS_WITH_WARNINGS
+## Review: all (security + quality + correctness) | Status: PASS
+
+Scope: cumulative diff `3a5571b8..HEAD` (commits b8a0b381, c1d4ab1a) over
+`src/nearcache/DataRecord.ts`, `src/nearcache/NearCache.ts`,
+`src/nearcache/NearCacheManager.ts`, `test/nearcache/NearCacheTest.js`.
+Branch `celeris/build-20260612115654`. Final pre-merge gate for 3.12.x.
+
+### Audit L1 re-verification (the gating finding)
+
+CONFIRMED CLOSED. Verified against actual code, not just the diff intent:
+
+- Base `3a5571b8:src/nearcache/NearCache.ts` had `private expirationTaskHandle`,
+  `this.startExpirationTask()` in the `NearCacheImpl` constructor (line 124), a
+  per-instance `setInterval` (line 279), and a `clearInterval` only inside
+  `destroy()` (lines 248-250) — exactly the L1 leak: a missed `postDestroy()`
+  (rejected `map.destroy()` round-trip) skips `destroy()`, so the per-instance
+  1s timer fires forever.
+- Current `NearCache.ts`: `grep` for `setInterval|clearInterval|startExpirationTask|
+  expirationTaskHandle|unref` returns NONE. The per-instance field, constructor
+  call, and `destroy()` clearInterval are all removed.
+- `NearCacheImpl.destroy()` (NearCache.ts:286-289) now only `internalStore.clear()`
+  + `resetExpirationQueue()` — no timer to clear. A missed proxy-destroy degrades
+  to benign dormant retention (store + queue stay referenced until client
+  shutdown), NOT a live perpetually-firing timer. Same failure mode as pre-fix.
+- Manager timer ownership verified end-to-end: `HazelcastClient.shutdown()`
+  (HazelcastClient.ts:375-380) calls `nearCacheManager.destroyAllNearCaches()`,
+  which (NearCacheManager.ts:63-67) clears the single shared interval exactly once
+  and nulls the handle.
+
+### Manager timer correctness (audit item 2)
+
+CONFIRMED CORRECT:
+- Single instance: one `expirationTaskHandle` on the manager.
+- Lazily started: `getOrCreateNearCache` starts it only when
+  `expirationTaskHandle === undefined` (NearCacheManager.ts:47-49).
+- `.unref()`'d: guarded `typeof handle.unref === 'function'` then `unref()`.
+- Cleared exactly once on shutdown via `destroyAllNearCaches` (guarded `!= null`,
+  then set `undefined` — idempotent).
+- Tick skips ttl=0: manager `doExpiration()` (NearCacheManager.ts:101-104) calls a
+  cache's `doExpiration()` only when `getTimeToLiveSeconds() > 0` (closes L5/L6).
+
+### FIFO expiration queue correctness
+
+CONFIRMED CORRECT:
+- Put-order == expiration-order invariant HOLDS. `DataRecord.expirationTime` is
+  computed once in the constructor for ttl>0 (DataRecord.ts:46-50) and
+  `setCreationTime()` early-returns for ttl>0 (DataRecord.ts:136-138), so it never
+  slides. No diff path mutates `expirationTime` after enqueue. The
+  `tryReserveForUpdate` → `tryPublishReserved` path stays consistent: expirationTime
+  is fixed at reservation (constructor); publish's `setCreationTime()` does not
+  change it, so the enqueued value remains valid.
+- Drain-from-front (NearCache.ts:326-346): stops at first non-expired head
+  (`head.expirationTime > now` → break); stale heads dropped lazily — key gone
+  (`cur === undefined`) or superseded generation
+  (`cur.getExpirationTime() !== head.expirationTime`) → cursor advanced, skipped,
+  store untouched. Reclamation routes through `expireRecord()` so `expiredCount`
+  accounting is intact. TTL-only: `isExpired(0)` disables max-idle; max-idle stays
+  lazy on read.
+- Enqueue coverage COMPLETE: the only two ttl>0 record-creation paths are `put()`
+  (NearCache.ts:234) and `tryReserveForUpdate()` (NearCache.ts:183) — both call
+  `enqueueExpiration()`. `tryPublishReserved` reuses the already-enqueued
+  reservation record (creates no new record) → no missing-enqueue regression. ttl=0
+  records are correctly never enqueued.
+- Compaction (NearCache.ts:374-402): two triggers — `overStale` rebuild keeps
+  exactly one element per live key (matching expirationTime + `seenKeys` dedup), and
+  a `slice()` prefix reclaim once the cursor passes the midpoint. Both reset
+  `expirationQueueHead = 0`, so the cursor stays valid after slice/rebuild. The
+  rebuild cannot drop a live-and-unexpired record: every finite-ttl live record has
+  exactly one queue element whose `expirationTime` matches, and it is retained.
+  Growth bounded by `EXPIRATION_QUEUE_STALE_FACTOR * store.size`. No off-by-one in
+  the cursor logic.
+- `clear()` (NearCache.ts:277) and `destroy()` (NearCache.ts:288) both call
+  `resetExpirationQueue()` → empties array AND resets cursor. No stale cursor past a
+  shrunk array.
+- ES5 safety: no `for...of` over Maps/iterators in the diff. `doExpiration` uses an
+  indexed while-loop; the compaction rebuild uses an indexed `for`; the only
+  `for...of` additions iterate `Array.from(this.caches.values())` (a real array),
+  matching the project's existing safe pattern. The prior dead-code bug is not
+  reintroduced.
+
+### Standard passes
+- Regression: get/put/invalidate/tryReserve/tryPublish bodies are identical to base
+  except added `enqueueExpiration()` calls and queue resets. No observable
+  read/write behavior change. The reclaim test was correctly rewritten to drive the
+  sweep via `doExpiration()` directly; new FIFO edge-case tests (overwrite, delete,
+  insertion-order) added.
+- Security: absolute, non-sliding TTL preserved — nothing here re-stamps
+  expirationTime or extends entry life. No regression of the audit's S4 net
+  improvement. No secrets, no injection surface, no input-trust change.
+- Resource/leak: per-instance timer eliminated; single unref()'d manager timer
+  cleared on shutdown; queue growth bounded. This is the fix's whole purpose and it
+  holds.
+- Conventions: bluebird `Promise` retained, no async/await, `0`=unlimited honored via
+  `> 0` guards, no public API surface change (DataRecord/NearCacheImpl and the new
+  `getExpirationTime`/`doExpiration`/`getTimeToLiveSeconds` accessors are internal,
+  not re-exported through `index`).
+- Compilation: `tsc --noEmit` reports 0 errors in `src/`. The only tsc output is
+  pre-existing `@types/bluebird` declaration-syntax noise from a node_modules
+  toolchain version mismatch — unrelated to this diff.
 
 ### Findings
 | Severity | File | Line | Issue | Fix |
 |----------|------|------|-------|-----|
-| HIGH | src/nearcache/NearCache.ts | 178, 132, 255-262 | `doExpiration()` does `Array.from(this.internalStore.values())` + full O(n) scan on EVERY `put()` and every `tryReserveForUpdate()` miss. On a hot write/read-through path with a large near cache this allocates a snapshot array and scans all records per write — a real throughput/GC concern at scale. | Throttle the sweep: gate it behind a time check (e.g. only sweep if `Date.now() - lastExpirationRun > expirationIntervalMs`) or a write counter, so it runs periodically rather than on every single write. Store `lastExpirationRun` as a field. Preserves correctness (read path still lazily expires) while removing per-write O(n) cost. |
-| MEDIUM | src/nearcache/DataRecord.ts | 121 | The guard `this.ttl > 0 && this.expirationTime > 0` makes `setCreationTime()` a silent no-op for ttl>0 records. Correct for the TTL-sliding fix, but it also silently drops the `creationTime` argument callers may pass — behavior now depends on hidden record state. Currently the only caller (`tryPublishReserved`) passes no arg, so safe today, but the method's contract is now surprising. | Acceptable as-is for the fix; consider a brief WHY note that the early-return intentionally ignores the passed `creationTime` for absolute-TTL records, and/or rename intent. No code change required. |
-| LOW | src/nearcache/NearCache.ts | 255 | `doExpiration()` is `protected` while `put`/`tryReserveForUpdate` are the only callers and the method is internal-only; fine, but it is not part of the `NearCache` interface and is reachable only via the concrete impl. Matches existing `doEvictionIfRequired`/`expireRecord` convention. | No action — convention-consistent. |
-| LOW | test/nearcache/NearCacheTest.js | 269-289 | The new `max-idle reset-on-read` test sits inside `describe('NearCacheImpl')`, which has a `before` hook that starts a real cluster/client, yet this test only uses an in-process `NearCacheImpl` and never touches the cluster — it pays cluster-startup cost for no reason. Timing (4 chained 250ms reads vs 1s idle) is sound but moderately tight. | Optional: move the pure in-process test outside the cluster-backed `describe`, or accept the existing pattern (other CacheRecord tests do the same). |
-
-### Notes (verified correct — no finding)
-- `setCreationTime` guard: ttl=0 records (`expirationTime===undefined`) skip the guard and still stamp correctly; first stamping for a ttl>0 reserved record happens in the constructor at reservation time, so TTL is absolute from near-cache insertion. Read-through publish no longer slides it. Correct.
-- `isExpired(0)` in `doExpiration()`: max-idle branch (`maxIdleSeconds > 0`) is disabled, only the absolute-TTL branch evaluates — sweep targets TTL-only, leaving max-idle lazy on the read path. Correct.
-- Mutation-during-iteration: `Array.from(...values())` snapshots before the loop, so `expireRecord()` deleting from the live store during iteration is safe.
-- `expiredCount` double-count: `expireRecord()` increments only when `internalStore.delete(key)` returns true, so the new sweep and the lazy `get`-path expiry cannot double-count the same key. Correct.
-- Max-idle reset-on-read: `setAccessTime()` and the `get()` path are unchanged. Preserved per requirement.
-- `0 = unlimited`: ttl=0 → `expirationTime===undefined` → `isExpired(0)` false; never swept. Preserved.
-- Constraints: no new deps, no async/await (bluebird only), no `NearCacheConfig`/public-API change, no codec change. All honored.
-- No secrets, no swallowed errors (test `catch` re-reports via `done(e)`). Conventions match the file.
+| LOW | src/nearcache/NearCache.ts | 354-359 | `enqueueExpiration` guards on `expirationTime > 0`; for ttl=0, `getExpirationTime()` returns `undefined` and `undefined > 0` is falsy — correct, but relies on an implicit undefined/number coercion that is slightly opaque. | Optional readability: `if (expirationTime !== undefined && expirationTime > 0)`. Behavior already correct. |
+| LOW | src/nearcache/NearCacheManager.ts | 30 | `private expirationTaskHandle: any;` uses `any` for the timer handle (mirrors the removed per-instance style). | Optional: type as `ReturnType<typeof setInterval>`. Non-blocking; consistent with surrounding code. |
 
 ### Summary
-CRITICAL: 0 | HIGH: 1 | MEDIUM: 1 | LOW: 2
-Action: Fix recommended before merge — address the HIGH per-write O(n) sweep (throttle it). The fix is functionally correct; the concern is hot-path performance at scale.
+CRITICAL: 0 | HIGH: 0 | MEDIUM: 0 | LOW: 2
+Action: Merge approved.
 
-## Decisions
-- HIGH (doExpiration per-write O(n) sweep): fixed af14e1df — throttled to EXPIRATION_TASK_INTERVAL_MS=1000, lastExpirationTime=0 init [2026-06-11]
-- MEDIUM (setCreationTime ignores arg for ttl>0): informational, no action
-- LOW x2 (max-idle test cost/timing): informational, no action
-- HIGH rework (2026-06-11): user rejected write-path-coupled sweep. Reworked in T4 (4bfb07f7) -> reclamation now a background setInterval task (mirrors RepairingTask), .unref()+destroy() teardown via NearCacheManager.destroyNearCache; doExpiration removed from put()/tryReserveForUpdate. Fully decoupled from put/get.
-- MEDIUM (setCreationTime ignores arg): fixed 29c92c50 — clarified guard comment (deliberate arg-drop for absolute-TTL).
-- LOW (max-idle test on cluster fixture): fixed 29c92c50 — moved to top-level sibling describe, no cluster before-hook, destroy() teardown added.
-- LOW (doExpiration protected): accepted — convention-consistent, no action.
-
-## Pre-Release Audit (2026-06-11) — deferred to next session
-- L1 (HIGH): near-cache timer+store leak when map.destroy() server round-trip fails (postDestroy skipped on reject). decision: DEFERRED — rework planned next session. See .sdlc/pre-release-audit.md.
-- L2 (MEDIUM): orphaned timer on proxy-create failure. decision: DEFERRED (fixed-for-free by L1 rework).
-- L5 (LOW-MED): unconditional 1s full-store sweep even for default ttl=0 config (wasted work). decision: DEFERRED.
-- L6 (MEDIUM): N per-cache timers vs single shared scheduler. decision: DEFERRED.
-- Regression audit: SAFE. Security audit: SAFE (net improvement). No code changed during audit.
-- PLANNED FIX: move sweep to a single NearCacheManager-level task gated on ttl>0; drop per-NearCacheImpl setInterval. Resolves L1+L2+L5+L6.
+STATUS: PASS
+Audit finding L1 (HIGH): CONFIRMED CLOSED — no per-NearCacheImpl timer remains; the
+sole sweep timer is the single unref()'d NearCacheManager interval, lazily started
+and cleared exactly once on HazelcastClient.shutdown → destroyAllNearCaches; a missed
+postDestroy() now degrades to benign dormant retention with no live timer.
