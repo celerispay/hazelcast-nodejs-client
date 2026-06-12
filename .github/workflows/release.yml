@@ -1,0 +1,65 @@
+name: Release to npm
+
+# Publishes @celerispay/hazelcast-client to the public npm registry when a
+# version tag is pushed. package.json is the source of truth for the version —
+# the tag must match it (e.g. tag "v3.12.7-6" -> package.json "3.12.7-6"), or
+# the run fails fast before publishing.
+#
+# Prerequisite: a repo/org secret named NPM_TOKEN — an npm automation token
+# (Account > Access Tokens > Automation) with publish rights to the @celerispay
+# scope. Set it under Settings > Secrets and variables > Actions.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build & publish to npm
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          registry-url: 'https://registry.npmjs.org'
+          scope: '@celerispay'
+
+      - name: Verify tag matches package.json version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"   # strip a leading "v": v3.12.7-6 -> 3.12.7-6
+          PKG="$(node -p "require('./package.json').version")"
+          echo "git tag (normalized) : $TAG"
+          echo "package.json version : $PKG"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "::error::Tag '${GITHUB_REF_NAME}' does not match package.json version '${PKG}'. Bump package.json, commit, then re-tag."
+            exit 1
+          fi
+
+      - name: Install dependencies
+        # NOTE: package-lock.json is git-ignored in this repo, so `npm ci` cannot
+        # run. Commit a lockfile and switch this to `npm ci` for reproducible,
+        # faster installs.
+        run: npm install --no-audit --no-fund
+
+      - name: Build (tsc -> lib/)
+        run: npm run compile
+
+      - name: Show package contents (sanity check, non-fatal)
+        run: npm pack --dry-run
+
+      - name: Publish to npm
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

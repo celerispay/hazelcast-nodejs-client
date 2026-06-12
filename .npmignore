@@ -14,3 +14,16 @@ scripts/
 *.log
 download-remote-controller.js
 DOCUMENTATION.md
+
+# Internal dev / tooling artifacts — must never be published to npm
+.sdlc/
+.dual-graph/
+.claude/
+.github/
+heapdump/
+*.heapsnapshot
+.nvmrc
+report.xml
+CLAUDE.md
+CONTEXT.md
+HANDOFF.md
