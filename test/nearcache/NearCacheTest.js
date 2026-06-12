@@ -253,24 +253,23 @@ describe('NearCacheImpl', function () {
                 if (nearCache.evictionPolicy !== EvictionPolicy.NONE || nearCache.timeToLiveSeconds === 0) {
                     this.skip();
                 }
-                // The near cache is created normally in beforeEach, so its background
-                // TTL sweep timer (EXPIRATION_TASK_INTERVAL_MS = 1000ms) is already
-                // running. Put the orphan, then wait long enough that BOTH the TTL has
-                // elapsed AND at least one background sweep tick has fired. We never read
-                // the orphan and never issue a second put — reclamation is driven purely
-                // by the background task. promiseAfter waits ttl*1500ms (1500ms for ttl=1),
-                // which exceeds the 1000ms TTL and the 1000ms sweep cadence.
+                // The per-cache background timer is gone — the TTL sweep is now owned by
+                // NearCacheManager's single shared timer, which calls each cache's public
+                // doExpiration() method. With no real manager/cluster here, we drive the
+                // sweep directly: put the orphan, wait past the TTL window WITHOUT ever
+                // reading it or issuing a second put, then invoke doExpiration() exactly
+                // as the manager tick would. promiseAfter waits ttl*1500ms (1500ms for
+                // ttl=1), which exceeds the 1000ms TTL so the record is expired by then.
                 nearCache.put(ds('orphan'), 'orphanval');
                 promiseAfter(nearCache.timeToLiveSeconds, function () {
                     try {
+                        // Drive the manager-owned TTL-only sweep directly (under NONE
+                        // eviction, nothing else would reclaim the never-read orphan).
+                        nearCache.doExpiration();
                         expect(nearCache.getStatistics().expiredCount).to.greaterThan(0);
                         expect(nearCache.getStatistics().entryCount).to.equal(0);
-                        // Stop the background timer (same teardown NearCacheManager uses)
-                        // so no setInterval leaks and the test process can exit cleanly.
-                        nearCache.destroy();
                         done();
                     } catch (e) {
-                        nearCache.destroy();
                         done(e);
                     }
                 });
@@ -355,13 +354,6 @@ describe('NearCacheImpl max-idle reset-on-read', function () {
         }
         return readKey().then(readKey).then(readKey).then(readKey).then(function (res) {
             expect(res).to.equal('val');
-            // Stop the background TTL sweep timer so no setInterval leaks and
-            // mocha can exit cleanly (success path).
-            nearCache.destroy();
-        }).catch(function (err) {
-            // Ensure the timer is cleared on the error path too, then rethrow.
-            nearCache.destroy();
-            throw err;
         });
     });
 });
