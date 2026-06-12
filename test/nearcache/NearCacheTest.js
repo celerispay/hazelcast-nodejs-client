@@ -357,3 +357,152 @@ describe('NearCacheImpl max-idle reset-on-read', function () {
         });
     });
 });
+
+// Cluster-free coverage for the FIFO expiration-queue drain (replaces the old
+// O(n) full-store scan). Constructs NearCacheImpl directly and drives the sweep
+// via doExpiration() — no remote-controller / cluster needed.
+describe('NearCacheImpl FIFO expiration queue', function () {
+
+    function ds(str) {
+        return {
+            val: str,
+            hashCode: function () {
+                return str[0] - 'a';
+            },
+            equals(other) {
+                return this.val === other.val;
+            }
+        }
+    }
+
+    function createSerializationService() {
+        var cfg = new Config.ClientConfig().serializationConfig;
+        return new SerializationService(undefined, cfg);
+    }
+
+    function promiseAfter(boundaryInSec, func) {
+        return promiseLater(boundaryInSec * 1500, func);
+    }
+
+    function newCache(ttlSeconds) {
+        var ncc = new Config.NearCacheConfig();
+        ncc.timeToLiveSeconds = ttlSeconds;
+        ncc.evictionMaxSize = 100;
+        ncc.evictionPolicy = EvictionPolicy.NONE;
+        var nearCache = new NearCacheImpl(ncc, createSerializationService());
+        nearCache.setReady();
+        return nearCache;
+    }
+
+    // Baseline (was the reclaim test): a ttl record never read is reclaimed by the
+    // queue drain once past its ttl window.
+    it('drains a ttl-expired entry that is never read again', function (done) {
+        var nearCache = newCache(1);
+        nearCache.put(ds('orphan'), 'orphanval');
+        promiseAfter(1, function () {
+            try {
+                nearCache.doExpiration();
+                expect(nearCache.getStatistics().expiredCount).to.greaterThan(0);
+                expect(nearCache.getStatistics().entryCount).to.equal(0);
+                done();
+            } catch (e) {
+                done(e);
+            }
+        });
+    });
+
+    // (a) Overwrite: a key re-put with a fresh ttl window before expiry must NOT be
+    // prematurely expired when the stale older queue element is drained — and must
+    // still expire after the NEW window.
+    it('does not prematurely expire an overwritten key with a refreshed ttl window', function (done) {
+        this.timeout(6000);
+        var nearCache = newCache(1);
+        nearCache.put(ds('key'), 'v1');
+        // Re-put well inside the first ttl window so the original expirationTime
+        // (gen 1) is in the past by the time we sweep, but the live record carries
+        // gen 2's later expirationTime.
+        promiseLater(700, function () {
+            nearCache.put(ds('key'), 'v2');
+            // Now past gen-1 ttl (~1000ms+ since first put) but inside gen-2 window.
+            promiseLater(500, function () {
+                try {
+                    nearCache.doExpiration(); // drains stale gen-1 head, keeps live gen-2
+                    expect(nearCache.getStatistics().entryCount).to.equal(1);
+                    expect(nearCache.getStatistics().expiredCount).to.equal(0);
+                } catch (e) {
+                    return done(e);
+                }
+                // After the gen-2 window fully elapses, it must expire.
+                promiseAfter(1, function () {
+                    try {
+                        nearCache.doExpiration();
+                        expect(nearCache.getStatistics().entryCount).to.equal(0);
+                        expect(nearCache.getStatistics().expiredCount).to.equal(1);
+                        done();
+                    } catch (e) {
+                        done(e);
+                    }
+                });
+            });
+        });
+    });
+
+    // (b) A deleted entry leaves the queue able to stop early without error: the
+    // stale head (key gone) is dropped, and a later non-expired entry halts the drain.
+    it('skips a deleted entry and stops at the first non-expired head', function (done) {
+        this.timeout(6000);
+        var nearCache = newCache(1);
+        nearCache.put(ds('aaa'), 'va');     // gen for 'a', enqueued first (oldest)
+        // Delete it (e.g. invalidate) — queue element becomes stale.
+        nearCache.invalidate(ds('aaa'));
+        // Put a younger entry that will NOT be expired at sweep time.
+        promiseLater(900, function () {
+            nearCache.put(ds('bbb'), 'vb'); // freshest, far from expiry
+            // Sweep ~ just after 'aaa' ttl elapsed but well before 'bbb' ttl.
+            promiseLater(200, function () {
+                try {
+                    nearCache.doExpiration();
+                    // No throw; deleted 'aaa' dropped lazily, 'bbb' survives, drain
+                    // stopped at the non-expired head.
+                    expect(nearCache.getStatistics().entryCount).to.equal(1);
+                    expect(nearCache.get(ds('bbb'))).to.eventually.equal('vb');
+                    done();
+                } catch (e) {
+                    done(e);
+                }
+            });
+        });
+    });
+
+    // (c) Staggered creationTimes expire in order; drain stops at the first
+    // non-expired head (the youngest entry put last survives an early sweep).
+    it('expires in insertion order and stops the drain at the first live head', function (done) {
+        this.timeout(6000);
+        var nearCache = newCache(1);
+        nearCache.put(ds('aaa'), 'va'); // oldest
+        promiseLater(400, function () {
+            nearCache.put(ds('bbb'), 'vb');
+            promiseLater(800, function () {
+                // ~1200ms after 'aaa' (expired), ~800ms after 'bbb' (still live).
+                try {
+                    nearCache.doExpiration();
+                    expect(nearCache.getStatistics().expiredCount).to.equal(1); // only 'aaa'
+                    expect(nearCache.getStatistics().entryCount).to.equal(1);   // 'bbb' survives
+                    // Then let 'bbb' age out too.
+                    promiseAfter(1, function () {
+                        try {
+                            nearCache.doExpiration();
+                            expect(nearCache.getStatistics().expiredCount).to.equal(2);
+                            expect(nearCache.getStatistics().entryCount).to.equal(0);
+                            done();
+                        } catch (e) {
+                            done(e);
+                        }
+                    });
+                } catch (e) {
+                    done(e);
+                }
+            });
+        });
+    });
+});

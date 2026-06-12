@@ -114,6 +114,17 @@ export class DataRecord {
         return this.status;
     }
 
+    /**
+     * Absolute expiry instant in ms (creationTime + ttl*1000), or undefined for
+     * ttl=0 (unlimited) records. Internal accessor used by the FIFO expiration
+     * queue drain to detect stale/overwritten queue elements: a queued element
+     * whose key now maps to a record with a different expirationTime belongs to
+     * a superseded generation and is skipped.
+     */
+    getExpirationTime(): number {
+        return this.expirationTime;
+    }
+
     setCreationTime(creationTime?: number): void {
         // TTL is absolute from the original put: once a ttl>0 record has its
         // expirationTime computed (in the constructor), the read-through publish
