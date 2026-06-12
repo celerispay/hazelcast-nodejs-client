@@ -37,3 +37,7 @@ docs/
 
 package-lock.json
 .dual-graph/
+
+# Heap snapshots — kept locally for profiling, never committed
+heapdump/
+*.heapsnapshot
